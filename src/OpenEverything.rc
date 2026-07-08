@@ -1,0 +1,5 @@
+#include "resource.h"
+
+IDI_APP_ICON ICON "..\\res\\OpenEverything.ico"
+
+IDR_MAIN_MANIFEST 24 "OpenEverything.manifest"
