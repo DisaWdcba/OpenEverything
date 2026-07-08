@@ -1,7 +1,7 @@
 #include "search.h"
 #include "index.h"
 
-#define SEARCH_LOCK_CHUNK 512
+#define SEARCH_LOCK_CHUNK 4096
 
 typedef struct {
     APP_STATE *app;
@@ -42,6 +42,43 @@ static int search_mask_slot(wchar_t ch)
         return 39;
     
     return -1;
+}
+
+static int search_query_has_plain_name_fast_path(const SEARCH_QUERY *query)
+{
+    if (!query || !query->text[0])
+        return 0;
+    if (query->match_path || query->match_case || query->match_whole_word ||
+        query->use_regex)
+        return 0;
+    if (wcschr(query->text, L'*') || wcschr(query->text, L'?'))
+        return 0;
+    if (StrStrIW(query->text, L"ext:") || StrStrIW(query->text, L"folder:"))
+        return 0;
+    return query->char_mask != 0;
+}
+
+static int search_best_name_char_slot(APP_STATE *app, const SEARCH_QUERY *query)
+{
+    int best_slot = -1;
+    int best_count = INT_MAX;
+    
+    if (!app || !query || !app->name_char_index_ready)
+        return -1;
+    
+    for (int slot = 0; slot < SEARCH_CHAR_SLOT_COUNT; slot++) {
+        if (query->char_mask & (1ULL << slot)) {
+            int count = app->name_char_counts[slot];
+            if (count <= 0)
+                return slot;
+            if (count < best_count) {
+                best_count = count;
+                best_slot = slot;
+            }
+        }
+    }
+    
+    return best_slot;
 }
 
 static int search_contains_ignore_case(const wchar_t *text, const wchar_t *needle)
@@ -167,7 +204,8 @@ static int compare_entries_for_query(const INDEX_ENTRY *a, const INDEX_ENTRY *b,
             break;
         case COL_NAME:
         default:
-            result = _wcsicmp(a->name ? a->name : L"", b->name ? b->name : L"");
+            result = wcscmp(a->folded_name ? a->folded_name : (a->name ? a->name : L""),
+                            b->folded_name ? b->folded_name : (b->name ? b->name : L""));
             break;
     }
     
@@ -346,6 +384,7 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
 {
     int count = 0;
     int i = 0;
+    int fast_slot = -1;
     
     if (!out_indices || max_results <= 0)
         return 0;
@@ -373,7 +412,47 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
         return count;
     }
     
-    if ((base_indices || base_identity) && base_count > 0) {
+    EnterCriticalSection(&app->index_lock);
+    if (!base_indices && !base_identity &&
+        search_query_has_plain_name_fast_path(query))
+        fast_slot = search_best_name_char_slot(app, query);
+    LeaveCriticalSection(&app->index_lock);
+    
+    if (fast_slot >= 0) {
+        for (;;) {
+            int end;
+            int entry_count;
+            int slot_count;
+            int *slot_indices;
+            
+            EnterCriticalSection(&app->index_lock);
+            
+            entry_count = app->entry_count;
+            slot_count = app->name_char_counts[fast_slot];
+            slot_indices = app->name_char_indices[fast_slot];
+            if (!app->name_char_index_ready ||
+                i >= slot_count || count >= max_results) {
+                LeaveCriticalSection(&app->index_lock);
+                break;
+            }
+            
+            end = i + SEARCH_LOCK_CHUNK;
+            if (end > slot_count)
+                end = slot_count;
+            
+            for (; i < end && count < max_results; i++) {
+                int idx = slot_indices ? slot_indices[i] : -1;
+                if (idx >= 0 && idx < entry_count &&
+                    search_match_entry(&app->entries[idx], query))
+                    out_indices[count++] = idx;
+            }
+            
+            LeaveCriticalSection(&app->index_lock);
+            if (generation != app->search_generation)
+                break;
+            Sleep(0);
+        }
+    } else if ((base_indices || base_identity) && base_count > 0) {
         for (;;) {
             int end;
             int entry_count;

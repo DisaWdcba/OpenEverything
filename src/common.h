@@ -77,6 +77,7 @@
 
 /* Search types */
 #define SEARCH_MAX_RESULTS               100000
+#define SEARCH_CHAR_SLOT_COUNT           40
 
 /* Entry string ownership flags */
 #define ENTRY_STRING_NAME_POOLED         0x01
@@ -318,6 +319,7 @@ typedef struct {
     long long parent_ref;
     int is_directory;
     int volume_index;
+    int metadata_loaded;
 } INDEX_ENTRY;
 
 typedef struct {
@@ -377,6 +379,10 @@ typedef struct {
     int *filtered_indices;
     int filtered_count;
     int filtered_identity;
+    int *name_char_index_pool;
+    int *name_char_indices[SEARCH_CHAR_SLOT_COUNT];
+    int name_char_counts[SEARCH_CHAR_SLOT_COUNT];
+    int name_char_index_ready;
     void *entry_string_pool;
     int cache_loaded;
     CRITICAL_SECTION index_lock;

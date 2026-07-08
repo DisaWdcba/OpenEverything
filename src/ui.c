@@ -23,6 +23,8 @@ static HBRUSH g_brush_window;
 static int g_icon_file = I_IMAGENONE;
 static int g_icon_folder = I_IMAGENONE;
 static HANDLE g_cache_thread;
+static IContextMenu2 *g_shell_menu2;
+static IContextMenu3 *g_shell_menu3;
 static volatile LONG g_reindexing = 0;
 static volatile LONG g_search_running = 0;
 static volatile LONG g_cache_loading = 0;
@@ -43,6 +45,12 @@ static int g_icon_cache_capacity;
 #define SEARCH_DEBOUNCE_MS 120
 #define STARTUP_SYNC_DELAY_MS 2500
 #define STARTUP_SYNC_MAX_CHANGES 16
+#define IDM_CTX_OPEN 20001
+#define IDM_CTX_OPEN_PATH 20002
+#define IDM_CTX_COPY_FULL_NAME 20003
+#define IDM_CTX_SET_RUN_COUNT 20004
+#define IDM_CTX_SHELL_FIRST 21000
+#define IDM_CTX_SHELL_LAST 24000
 struct SearchJob {
     APP_STATE *app;
     HWND hwnd;
@@ -72,6 +80,19 @@ static void ui_format_count(wchar_t *buf, size_t buf_size, int value);
 static void ui_init_system_icons(HWND hwndList);
 static int ui_icon_for_type(int is_directory, const wchar_t *extension);
 static void ui_clear_icon_cache(void);
+static int ui_copy_text_to_clipboard(HWND hwnd, const wchar_t *text);
+static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
+                                  wchar_t **out_path, int *out_is_dir);
+static void ui_open_entry_path(HWND hwnd, const wchar_t *path);
+static void ui_open_entry_parent(HWND hwnd, const wchar_t *path);
+static IContextMenu *ui_create_shell_context_menu(HWND hwnd, const wchar_t *path);
+static int ui_append_shell_context_menu(HWND hwnd, HMENU menu, const wchar_t *path,
+                                        IContextMenu **out_menu);
+static void ui_release_shell_menu_handlers(void);
+static void ui_invoke_shell_context_command(HWND hwnd, IContextMenu *menu,
+                                            int cmd, POINT pt);
+static void ui_ensure_row_metadata(APP_STATE *app, int row);
+static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size);
 static void ui_queue_search(HWND hwnd);
 static void ui_start_search(HWND hwnd);
 static void ui_start_cache_load(HWND hwnd);
@@ -252,6 +273,277 @@ static void ui_get_parent_path(const INDEX_ENTRY *entry, wchar_t *buf, size_t bu
         *last = L'\0';
 }
 
+static void ui_ensure_row_metadata(APP_STATE *app, int row)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    ULARGE_INTEGER size;
+    wchar_t *path = NULL;
+    int is_directory = 0;
+    int idx = -1;
+    long long file_ref = 0;
+    int volume_index = -1;
+    int loaded = 0;
+    
+    if (!app || row < 0)
+        return;
+    
+    EnterCriticalSection(&app->index_lock);
+    if (row >= 0 && row < app->filtered_count) {
+        idx = app->filtered_identity ? row : app->filtered_indices[row];
+        if (idx >= 0 && idx < app->entry_count) {
+            INDEX_ENTRY *entry = &app->entries[idx];
+            loaded = entry->metadata_loaded;
+            is_directory = entry->is_directory;
+            file_ref = entry->file_ref;
+            volume_index = entry->volume_index;
+            if (!loaded && entry->path && entry->path[0])
+                path = _wcsdup(entry->path);
+        }
+    }
+    LeaveCriticalSection(&app->index_lock);
+    
+    if (loaded || !path)
+        return;
+    
+    memset(&data, 0, sizeof(data));
+    loaded = GetFileAttributesExW(path, GetFileExInfoStandard, &data) ? 1 : 0;
+    
+    EnterCriticalSection(&app->index_lock);
+    if (idx >= 0 && idx < app->entry_count) {
+        INDEX_ENTRY *entry = &app->entries[idx];
+        if (entry->file_ref == file_ref &&
+            entry->volume_index == volume_index &&
+            entry->path && wcscmp(entry->path, path) == 0) {
+            if (loaded) {
+                entry->attributes = data.dwFileAttributes;
+                entry->creation_time = ((long long)data.ftCreationTime.dwHighDateTime << 32) |
+                                       data.ftCreationTime.dwLowDateTime;
+                entry->modification_time = ((long long)data.ftLastWriteTime.dwHighDateTime << 32) |
+                                           data.ftLastWriteTime.dwLowDateTime;
+                entry->access_time = ((long long)data.ftLastAccessTime.dwHighDateTime << 32) |
+                                     data.ftLastAccessTime.dwLowDateTime;
+                
+                size.LowPart = data.nFileSizeLow;
+                size.HighPart = data.nFileSizeHigh;
+                entry->size = is_directory ? 0 : (long long)size.QuadPart;
+            } else {
+                entry->size = 0;
+                entry->creation_time = 0;
+                entry->modification_time = 0;
+                entry->access_time = 0;
+            }
+            entry->metadata_loaded = 1;
+        }
+    }
+    LeaveCriticalSection(&app->index_lock);
+    
+    free(path);
+}
+
+static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size)
+{
+    FILETIME ft;
+    FILETIME local;
+    SYSTEMTIME st;
+    
+    if (!buf || buf_size == 0)
+        return;
+    
+    ft.dwLowDateTime = (DWORD)ft64;
+    ft.dwHighDateTime = (DWORD)(ft64 >> 32);
+    if (ft64 &&
+        FileTimeToLocalFileTime(&ft, &local) &&
+        FileTimeToSystemTime(&local, &st)) {
+        swprintf_s(buf, buf_size, L"%04d-%02d-%02d %02d:%02d:%02d",
+                   st.wYear, st.wMonth, st.wDay,
+                   st.wHour, st.wMinute, st.wSecond);
+    } else {
+        wcscpy_s(buf, buf_size, L"");
+    }
+}
+
+static int ui_copy_text_to_clipboard(HWND hwnd, const wchar_t *text)
+{
+    size_t len;
+    HGLOBAL hMem;
+    wchar_t *dst;
+    
+    if (!text)
+        text = L"";
+    
+    if (!OpenClipboard(hwnd))
+        return 0;
+    
+    EmptyClipboard();
+    len = (wcslen(text) + 1) * sizeof(wchar_t);
+    hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (!hMem) {
+        CloseClipboard();
+        return 0;
+    }
+    
+    dst = (wchar_t *)GlobalLock(hMem);
+    if (!dst) {
+        GlobalFree(hMem);
+        CloseClipboard();
+        return 0;
+    }
+    
+    wcscpy_s(dst, len / sizeof(wchar_t), text);
+    GlobalUnlock(hMem);
+    SetClipboardData(CF_UNICODETEXT, hMem);
+    CloseClipboard();
+    return 1;
+}
+
+static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
+                                  wchar_t **out_path, int *out_is_dir)
+{
+    INDEX_ENTRY *entry;
+    
+    if (out_name) *out_name = NULL;
+    if (out_path) *out_path = NULL;
+    if (out_is_dir) *out_is_dir = 0;
+    if (!app)
+        return 0;
+    
+    EnterCriticalSection(&app->index_lock);
+    entry = ui_entry_from_row(app, row);
+    if (entry) {
+        if (out_name)
+            *out_name = _wcsdup(entry->name ? entry->name : L"");
+        if (out_path)
+            *out_path = _wcsdup(entry->path ? entry->path : L"");
+        if (out_is_dir)
+            *out_is_dir = entry->is_directory;
+    }
+    LeaveCriticalSection(&app->index_lock);
+    
+    if (!entry)
+        return 0;
+    if ((out_name && !*out_name) || (out_path && !*out_path)) {
+        if (out_name) { free(*out_name); *out_name = NULL; }
+        if (out_path) { free(*out_path); *out_path = NULL; }
+        return 0;
+    }
+    
+    return 1;
+}
+
+static void ui_open_entry_path(HWND hwnd, const wchar_t *path)
+{
+    if (path && path[0])
+        ShellExecuteW(hwnd, L"open", path, NULL, NULL, SW_SHOW);
+}
+
+static void ui_open_entry_parent(HWND hwnd, const wchar_t *path)
+{
+    wchar_t dir[MAX_PATH * 2];
+    wchar_t *last;
+    
+    if (!path || !path[0])
+        return;
+    
+    wcscpy_s(dir, MAX_PATH * 2, path);
+    last = wcsrchr(dir, L'\\');
+    if (last) {
+        *last = L'\0';
+        ShellExecuteW(hwnd, L"open", dir, NULL, NULL, SW_SHOW);
+    }
+}
+
+static void ui_release_shell_menu_handlers(void)
+{
+    if (g_shell_menu3) {
+        g_shell_menu3->lpVtbl->Release(g_shell_menu3);
+        g_shell_menu3 = NULL;
+    }
+    if (g_shell_menu2) {
+        g_shell_menu2->lpVtbl->Release(g_shell_menu2);
+        g_shell_menu2 = NULL;
+    }
+}
+
+static IContextMenu *ui_create_shell_context_menu(HWND hwnd, const wchar_t *path)
+{
+    PIDLIST_ABSOLUTE pidl = NULL;
+    PCUITEMID_CHILD child = NULL;
+    IShellFolder *parent = NULL;
+    IContextMenu *menu = NULL;
+    HRESULT hr;
+    
+    if (!path || !path[0])
+        return NULL;
+    
+    hr = SHParseDisplayName(path, NULL, &pidl, 0, NULL);
+    if (FAILED(hr) || !pidl)
+        return NULL;
+    
+    hr = SHBindToParent(pidl, &IID_IShellFolder, (void **)&parent, &child);
+    if (SUCCEEDED(hr) && parent && child) {
+        parent->lpVtbl->GetUIObjectOf(parent, hwnd, 1, &child,
+                                      &IID_IContextMenu, NULL, (void **)&menu);
+    }
+    
+    if (parent)
+        parent->lpVtbl->Release(parent);
+    CoTaskMemFree(pidl);
+    return menu;
+}
+
+static int ui_append_shell_context_menu(HWND hwnd, HMENU menu, const wchar_t *path,
+                                        IContextMenu **out_menu)
+{
+    IContextMenu *shell_menu;
+    HRESULT hr;
+    
+    if (out_menu)
+        *out_menu = NULL;
+    
+    shell_menu = ui_create_shell_context_menu(hwnd, path);
+    if (!shell_menu)
+        return 0;
+    
+    hr = shell_menu->lpVtbl->QueryContextMenu(shell_menu, menu,
+                                             GetMenuItemCount(menu),
+                                             IDM_CTX_SHELL_FIRST,
+                                             IDM_CTX_SHELL_LAST,
+                                             CMF_NORMAL);
+    if (FAILED(hr)) {
+        shell_menu->lpVtbl->Release(shell_menu);
+        return 0;
+    }
+    
+    ui_release_shell_menu_handlers();
+    shell_menu->lpVtbl->QueryInterface(shell_menu, &IID_IContextMenu2, (void **)&g_shell_menu2);
+    shell_menu->lpVtbl->QueryInterface(shell_menu, &IID_IContextMenu3, (void **)&g_shell_menu3);
+    
+    if (out_menu)
+        *out_menu = shell_menu;
+    else
+        shell_menu->lpVtbl->Release(shell_menu);
+    return 1;
+}
+
+static void ui_invoke_shell_context_command(HWND hwnd, IContextMenu *menu,
+                                            int cmd, POINT pt)
+{
+    CMINVOKECOMMANDINFOEX info;
+    
+    if (!menu || cmd < IDM_CTX_SHELL_FIRST || cmd > IDM_CTX_SHELL_LAST)
+        return;
+    
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+    info.hwnd = hwnd;
+    info.lpVerb = MAKEINTRESOURCEA(cmd - IDM_CTX_SHELL_FIRST);
+    info.lpVerbW = MAKEINTRESOURCEW(cmd - IDM_CTX_SHELL_FIRST);
+    info.nShow = SW_SHOWNORMAL;
+    info.ptInvoke = pt;
+    menu->lpVtbl->InvokeCommand(menu, (LPCMINVOKECOMMANDINFO)&info);
+}
+
 static DWORD WINAPI search_thread_proc(void *p)
 {
     struct SearchJob *job = (struct SearchJob *)p;
@@ -323,6 +615,8 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     loaded = cache_load_index(ctx->app);
+    if (loaded)
+        index_build_name_char_index(ctx->app);
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     
     InterlockedExchange(&g_cache_loading, 0);
@@ -672,6 +966,7 @@ static DWORD WINAPI reindex_thread_proc(void *p)
     a->index_error_count = failed_volumes;
     index_build_paths(a);
     index_sort_entries_by_name(a);
+    index_build_name_char_index(a);
     if (a->entry_count > 0)
         cache_save_index(a);
     PostMessageW(c->hwnd, WM_INDEX_DONE, 0, 0);
@@ -772,6 +1067,21 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     APP_STATE *app = g_app_ptr;
     
     switch (msg) {
+    case WM_INITMENUPOPUP:
+    case WM_DRAWITEM:
+    case WM_MEASUREITEM:
+    case WM_MENUCHAR:
+    {
+        LRESULT result = 0;
+        if (g_shell_menu3 &&
+            SUCCEEDED(g_shell_menu3->lpVtbl->HandleMenuMsg2(g_shell_menu3, msg, wParam, lParam, &result)))
+            return result;
+        if (g_shell_menu2 &&
+            SUCCEEDED(g_shell_menu2->lpVtbl->HandleMenuMsg(g_shell_menu2, msg, wParam, lParam)))
+            return 0;
+        break;
+    }
+    
     /* ---- Window creation ---- */
     case WM_CREATE:
     {
@@ -865,10 +1175,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         LVCOLUMNW col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         
-        col.pszText = L"Name";          col.cx = 450; col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
-        col.pszText = L"Path";          col.cx = 760; col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
-        col.pszText = L"Size";          col.cx = 0;   col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
-        col.pszText = L"Date Modified"; col.cx = 0;   col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
+        col.pszText = L"Name";          col.cx = 380; col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
+        col.pszText = L"Path";          col.cx = 520; col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
+        col.pszText = L"Size";          col.cx = 96;  col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
+        col.pszText = L"Date Modified"; col.cx = 150; col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
         col.pszText = L"Date Created";  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
         col.pszText = L"Attributes";    col.cx = 0;   col.iSubItem = 5; ListView_InsertColumn(g_hwndList, 5, &col);
         
@@ -922,11 +1232,16 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         
         /* Resize list columns proportionally */
         int total_width = rc.right - GetSystemMetrics(SM_CXVSCROLL);
-        if (total_width < 300) total_width = 300;
-        ListView_SetColumnWidth(g_hwndList, 0, total_width * 33 / 100);
-        ListView_SetColumnWidth(g_hwndList, 1, total_width - (total_width * 33 / 100));
-        ListView_SetColumnWidth(g_hwndList, 2, 0);
-        ListView_SetColumnWidth(g_hwndList, 3, 0);
+        int size_width = 96;
+        int modified_width = 150;
+        int text_width;
+        if (total_width < 500) total_width = 500;
+        text_width = total_width - size_width - modified_width;
+        if (text_width < 260) text_width = 260;
+        ListView_SetColumnWidth(g_hwndList, 0, text_width * 40 / 100);
+        ListView_SetColumnWidth(g_hwndList, 1, text_width - (text_width * 40 / 100));
+        ListView_SetColumnWidth(g_hwndList, 2, size_width);
+        ListView_SetColumnWidth(g_hwndList, 3, modified_width);
         ListView_SetColumnWidth(g_hwndList, 4, 0);
         ListView_SetColumnWidth(g_hwndList, 5, 0);
         
@@ -1097,6 +1412,14 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 int icon_is_dir = 0;
                 icon_ext[0] = L'\0';
                 
+                if ((di->item.mask & LVIF_TEXT) &&
+                    (di->item.iSubItem == COL_SIZE ||
+                     di->item.iSubItem == COL_DATE_MODIFIED ||
+                     di->item.iSubItem == COL_DATE_CREATED ||
+                     di->item.iSubItem == COL_ATTRIBUTES)) {
+                    ui_ensure_row_metadata(app, di->item.iItem);
+                }
+                
                 EnterCriticalSection(&app->index_lock);
                 e = ui_entry_from_row(app, di->item.iItem);
                 
@@ -1123,37 +1446,13 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                             di->item.pszText = text_buf;
                             break;
                         case COL_DATE_MODIFIED:
-                        {
-                            FILETIME ft;
-                            SYSTEMTIME st;
-                            ft.dwLowDateTime = (DWORD)e->modification_time;
-                            ft.dwHighDateTime = (DWORD)(e->modification_time >> 32);
-                            if (e->modification_time && FileTimeToSystemTime(&ft, &st)) {
-                                swprintf_s(text_buf, 512, L"%04d-%02d-%02d %02d:%02d:%02d",
-                                           st.wYear, st.wMonth, st.wDay,
-                                           st.wHour, st.wMinute, st.wSecond);
-                            } else {
-                                wcscpy_s(text_buf, 512, L"");
-                            }
+                            ui_format_filetime(e->modification_time, text_buf, 512);
                             di->item.pszText = text_buf;
                             break;
-                        }
                         case COL_DATE_CREATED:
-                        {
-                            FILETIME ft;
-                            SYSTEMTIME st;
-                            ft.dwLowDateTime = (DWORD)e->creation_time;
-                            ft.dwHighDateTime = (DWORD)(e->creation_time >> 32);
-                            if (e->creation_time && FileTimeToSystemTime(&ft, &st)) {
-                                swprintf_s(text_buf, 512, L"%04d-%02d-%02d %02d:%02d:%02d",
-                                           st.wYear, st.wMonth, st.wDay,
-                                           st.wHour, st.wMinute, st.wSecond);
-                            } else {
-                                wcscpy_s(text_buf, 512, L"");
-                            }
+                            ui_format_filetime(e->creation_time, text_buf, 512);
                             di->item.pszText = text_buf;
                             break;
-                        }
                         case COL_ATTRIBUTES:
                             ntfs_format_attributes(text_buf, 512, e->attributes);
                             di->item.pszText = text_buf;
@@ -1230,93 +1529,69 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         HWND hwndFrom = (HWND)wParam;
         if (hwndFrom == g_hwndList) {
             int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
-            if (sel >= 0) {
+            if (sel >= 0 && sel < app->filtered_count) {
                 HMENU hPopup = CreatePopupMenu();
-                AppendMenuW(hPopup, MF_STRING, 20001, L"Open");
-                AppendMenuW(hPopup, MF_STRING, 20002, L"Open Path");
-                AppendMenuW(hPopup, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(hPopup, MF_STRING, 20003, L"Copy");
-                AppendMenuW(hPopup, MF_STRING, 20004, L"Copy Full Path");
-                AppendMenuW(hPopup, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(hPopup, MF_STRING, 20005, L"Delete");
-                
                 POINT pt;
+                wchar_t *entry_name = NULL;
+                wchar_t *entry_path = NULL;
+                int entry_is_dir = 0;
+                IContextMenu *shell_menu = NULL;
+                int cmd;
+                
+                if (!ui_copy_entry_snapshot(app, sel, &entry_name, &entry_path, &entry_is_dir)) {
+                    DestroyMenu(hPopup);
+                    return 0;
+                }
+                
                 pt.x = LOWORD(lParam);
                 pt.y = HIWORD(lParam);
-                
-                int cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_NONOTIFY,
-                                        pt.x, pt.y, 0, hwnd, NULL);
-                
-                if (sel < app->filtered_count) {
-                    INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                    if (!e) {
-                        DestroyMenu(hPopup);
-                        return 0;
-                    }
-                    
-                    switch (cmd) {
-                    case 20001: /* Open */
-                        if (e->path) ShellExecuteW(hwnd, L"open", e->path, NULL, NULL, SW_SHOW);
-                        break;
-                    case 20002: /* Open Path */
-                    {
-                        wchar_t dir[MAX_PATH];
-                        wcscpy_s(dir, MAX_PATH, e->path);
-                        wchar_t *last = wcsrchr(dir, L'\\');
-                        if (last) {
-                            *last = L'\0';
-                            ShellExecuteW(hwnd, L"explore", dir, NULL, NULL, SW_SHOW);
-                        }
-                        break;
-                    }
-                    case 20003: /* Copy */
-                        if (OpenClipboard(hwnd)) {
-                            EmptyClipboard();
-                            size_t len = (wcslen(e->name) + 1) * sizeof(wchar_t);
-                            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-                            if (hMem) {
-                                wcscpy_s((wchar_t *)GlobalLock(hMem), len / sizeof(wchar_t), e->name);
-                                GlobalUnlock(hMem);
-                                SetClipboardData(CF_UNICODETEXT, hMem);
-                            }
-                            CloseClipboard();
-                        }
-                        break;
-                    case 20004: /* Copy Full Path */
-                        if (OpenClipboard(hwnd)) {
-                            EmptyClipboard();
-                            size_t len = (wcslen(e->path) + 1) * sizeof(wchar_t);
-                            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-                            if (hMem) {
-                                wcscpy_s((wchar_t *)GlobalLock(hMem), len / sizeof(wchar_t), e->path);
-                                GlobalUnlock(hMem);
-                                SetClipboardData(CF_UNICODETEXT, hMem);
-                            }
-                            CloseClipboard();
-                        }
-                        break;
-                    case 20005: /* Delete */
-                    {
-                        wchar_t msg[1024];
-                        swprintf_s(msg, 1024, L"Delete \"%s\"?", e->name);
-                        if (MessageBoxW(hwnd, msg, L"Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            if (e->is_directory) {
-                                SHFILEOPSTRUCTW op = {0};
-                                wchar_t from[MAX_PATH * 2];
-                                wcscpy_s(from, MAX_PATH * 2, e->path);
-                                from[wcslen(from) + 1] = L'\0';
-                                op.wFunc = FO_DELETE;
-                                op.pFrom = from;
-                                op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
-                                SHFileOperationW(&op);
-                            } else {
-                                DeleteFileW(e->path);
-                            }
-                        }
-                        break;
-                    }
+                if (pt.x == -1 && pt.y == -1) {
+                    RECT item_rc;
+                    item_rc.left = LVIR_BOUNDS;
+                    if (ListView_GetItemRect(g_hwndList, sel, &item_rc, LVIR_BOUNDS)) {
+                        pt.x = item_rc.left;
+                        pt.y = item_rc.bottom;
+                        ClientToScreen(g_hwndList, &pt);
+                    } else {
+                        GetCursorPos(&pt);
                     }
                 }
+                
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_OPEN, L"Open");
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_OPEN_PATH, L"Open Path");
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_COPY_FULL_NAME, L"Copy Full Name to Clipboard");
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_SET_RUN_COUNT, L"Set Run Count");
+                AppendMenuW(hPopup, MF_SEPARATOR, 0, NULL);
+                ui_append_shell_context_menu(hwnd, hPopup, entry_path, &shell_menu);
+                
+                cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_NONOTIFY,
+                                     pt.x, pt.y, 0, hwnd, NULL);
+                
+                switch (cmd) {
+                case IDM_CTX_OPEN:
+                    ui_open_entry_path(hwnd, entry_path);
+                    break;
+                case IDM_CTX_OPEN_PATH:
+                    ui_open_entry_parent(hwnd, entry_path);
+                    break;
+                case IDM_CTX_COPY_FULL_NAME:
+                    ui_copy_text_to_clipboard(hwnd, entry_path);
+                    break;
+                case IDM_CTX_SET_RUN_COUNT:
+                    MessageBoxW(hwnd, L"Set Run Count is not implemented yet.",
+                                L"OpenEverything", MB_OK | MB_ICONINFORMATION);
+                    break;
+                default:
+                    if (cmd >= IDM_CTX_SHELL_FIRST && cmd <= IDM_CTX_SHELL_LAST)
+                        ui_invoke_shell_context_command(hwnd, shell_menu, cmd, pt);
+                    break;
+                }
+                
+                if (shell_menu)
+                    shell_menu->lpVtbl->Release(shell_menu);
+                ui_release_shell_menu_handlers();
+                free(entry_name);
+                free(entry_path);
                 DestroyMenu(hPopup);
             }
         }

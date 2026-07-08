@@ -377,9 +377,9 @@ int cache_load_index(APP_STATE *app)
             }
             
             string_chars += (size_t)ce.name_len + 1;
+            string_chars += (size_t)ce.path_len + 1;
             string_chars += (size_t)ce.extension_len + 1;
             string_chars += (size_t)ce.name_len + 1;
-            string_chars += (size_t)ce.path_len + 1;
             
             if ((i & 8191) == 0)
                 Sleep(0);
@@ -426,6 +426,7 @@ int cache_load_index(APP_STATE *app)
         e->usn = ce.usn;
         e->is_directory = ce.is_directory;
         e->volume_index = ce.volume_index;
+        e->metadata_loaded = (ce.size != 0 || ce.creation_time != 0 || ce.access_time != 0);
         
         e->name = cache_copy_wstring_to_pool(&cursor, end, ce.name_len, &pool_cursor);
         e->path = cache_copy_wstring_to_pool(&cursor, end, ce.path_len, &pool_cursor);
@@ -459,6 +460,7 @@ int cache_load_index(APP_STATE *app)
     old_entry_count = app->entry_count;
     old_filtered = app->filtered_indices;
     old_string_pool = app->entry_string_pool;
+    index_clear_name_char_index(app);
     
     app->entries = entries;
     app->entry_count = header.entry_count;

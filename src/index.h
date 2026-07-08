@@ -10,6 +10,8 @@ int index_add_entry(APP_STATE *app, INDEX_ENTRY *entry);
 int index_add_entries(APP_STATE *app, INDEX_ENTRY *entries, int count);
 int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count);
 void index_build_paths(APP_STATE *app);
+int index_build_name_char_index(APP_STATE *app);
+void index_clear_name_char_index(APP_STATE *app);
 void index_sort_entries_by_name(APP_STATE *app);
 int index_sort_by_name(const void *a, const void *b);
 int index_sort_by_path(const void *a, const void *b);
