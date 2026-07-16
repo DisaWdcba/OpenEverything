@@ -44,7 +44,8 @@ static int g_icon_cache_capacity;
 #define IDT_STARTUP_SYNC 2
 #define SEARCH_DEBOUNCE_MS 120
 #define STARTUP_SYNC_DELAY_MS 2500
-#define STARTUP_SYNC_MAX_CHANGES 16
+#define USN_SYNC_MAX_CHANGES 16384
+#define USN_MONITOR_INTERVAL_MS 750
 #define IDM_CTX_OPEN 20001
 #define IDM_CTX_OPEN_PATH 20002
 #define IDM_CTX_COPY_FULL_NAME 20003
@@ -74,6 +75,11 @@ struct CacheLoadCtx {
     HWND hwnd;
 };
 
+struct OpenPathJob {
+    wchar_t *path;
+    int open_parent;
+};
+
 static void ui_init_visual_resources(void);
 static void ui_free_visual_resources(void);
 static void ui_format_count(wchar_t *buf, size_t buf_size, int value);
@@ -85,6 +91,7 @@ static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
                                   wchar_t **out_path, int *out_is_dir);
 static void ui_open_entry_path(HWND hwnd, const wchar_t *path);
 static void ui_open_entry_parent(HWND hwnd, const wchar_t *path);
+static DWORD WINAPI ui_open_path_thread_proc(void *p);
 static IContextMenu *ui_create_shell_context_menu(HWND hwnd, const wchar_t *path);
 static int ui_append_shell_context_menu(HWND hwnd, HMENU menu, const wchar_t *path,
                                         IContextMenu **out_menu);
@@ -430,26 +437,82 @@ static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
     return 1;
 }
 
-static void ui_open_entry_path(HWND hwnd, const wchar_t *path)
+static DWORD WINAPI ui_open_path_thread_proc(void *p)
 {
-    if (path && path[0])
-        ShellExecuteW(hwnd, L"open", path, NULL, NULL, SW_SHOW);
+    struct OpenPathJob *job = (struct OpenPathJob *)p;
+    HRESULT com_result;
+    SHELLEXECUTEINFOW info;
+    wchar_t *target;
+    wchar_t *last;
+    
+    if (!job)
+        return 0;
+    
+    target = job->path;
+    if (job->open_parent && target) {
+        last = wcsrchr(target, L'\\');
+        if (last && last > target) {
+            if (last == target + 2 && target[1] == L':')
+                last[1] = L'\0';
+            else
+                *last = L'\0';
+        }
+    }
+    
+    com_result = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_ASYNCOK;
+    info.lpVerb = L"open";
+    info.lpFile = target;
+    info.nShow = SW_SHOWNORMAL;
+    if (target && target[0])
+        ShellExecuteExW(&info);
+    if (SUCCEEDED(com_result))
+        CoUninitialize();
+    
+    free(job->path);
+    free(job);
+    return 0;
 }
 
-static void ui_open_entry_parent(HWND hwnd, const wchar_t *path)
+static void ui_queue_open_path(const wchar_t *path, int open_parent)
 {
-    wchar_t dir[MAX_PATH * 2];
-    wchar_t *last;
+    struct OpenPathJob *job;
+    HANDLE thread;
     
     if (!path || !path[0])
         return;
     
-    wcscpy_s(dir, MAX_PATH * 2, path);
-    last = wcsrchr(dir, L'\\');
-    if (last) {
-        *last = L'\0';
-        ShellExecuteW(hwnd, L"open", dir, NULL, NULL, SW_SHOW);
+    job = (struct OpenPathJob *)calloc(1, sizeof(*job));
+    if (!job)
+        return;
+    job->path = _wcsdup(path);
+    job->open_parent = open_parent;
+    if (!job->path) {
+        free(job);
+        return;
     }
+    
+    thread = CreateThread(NULL, 0, ui_open_path_thread_proc, job, 0, NULL);
+    if (thread)
+        CloseHandle(thread);
+    else {
+        free(job->path);
+        free(job);
+    }
+}
+
+static void ui_open_entry_path(HWND hwnd, const wchar_t *path)
+{
+    (void)hwnd;
+    ui_queue_open_path(path, 0);
+}
+
+static void ui_open_entry_parent(HWND hwnd, const wchar_t *path)
+{
+    (void)hwnd;
+    ui_queue_open_path(path, 1);
 }
 
 static void ui_release_shell_menu_handlers(void)
@@ -613,15 +676,15 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     struct CacheLoadCtx *ctx = (struct CacheLoadCtx *)p;
     int loaded;
     
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     loaded = cache_load_index(ctx->app);
-    if (loaded)
-        index_build_name_char_index(ctx->app);
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-    
     InterlockedExchange(&g_cache_loading, 0);
     if (!ctx->app->shutting_down)
         PostMessageW(ctx->hwnd, loaded ? WM_CACHE_LOADED : WM_REFRESH, 0, 0);
+    if (loaded && !ctx->app->shutting_down) {
+        index_build_ref_index(ctx->app);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        index_build_name_char_index(ctx->app);
+    }
     free(ctx);
     return 0;
 }
@@ -830,11 +893,7 @@ static int usn_sync_once(APP_STATE *app, int *needs_rebuild, int *changed_count)
             
             int read_changes = ntfs_read_usn_changes(hVol, saved_next_usn, journal.UsnJournalId,
                                                      journal.NextUsn, i, &changes, &change_count,
-                                                     &next_usn, STARTUP_SYNC_MAX_CHANGES);
-            if (read_changes == 2) {
-                ntfs_close_volume(hVol);
-                continue;
-            }
+                                                     &next_usn, USN_SYNC_MAX_CHANGES);
             if (!read_changes) {
                 ntfs_close_volume(hVol);
                 continue;
@@ -868,18 +927,37 @@ static DWORD WINAPI usn_startup_sync_thread_proc(void *p)
     struct UsnStartupSyncCtx *ctx = (struct UsnStartupSyncCtx *)p;
     APP_STATE *app = ctx->app;
     HWND hwnd = ctx->hwnd;
-    int needs_rebuild = 0;
-    int changed_count = 0;
+    int idle_cycles = 0;
     
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     
-    if (usn_sync_once(app, &needs_rebuild, &changed_count)) {
-        if (app->shutting_down) {
-            /* App is exiting; skip UI work. */
-        } else if (needs_rebuild) {
-            /* Keep the cached index usable; never auto-rebuild during startup. */
-        } else if (changed_count > 0) {
+    while (app->monitor_running && !app->shutting_down) {
+        int needs_rebuild = 0;
+        int changed_count = 0;
+        int sync_ok = usn_sync_once(app, &needs_rebuild, &changed_count);
+        
+        if (!sync_ok || needs_rebuild)
+            break;
+        if (changed_count > 0) {
+            idle_cycles = 0;
             PostMessageW(hwnd, WM_INDEX_SYNCED, (WPARAM)changed_count, 0);
+        } else {
+            int name_index_ready;
+            idle_cycles++;
+            EnterCriticalSection(&app->index_lock);
+            name_index_ready = app->name_char_index_ready;
+            LeaveCriticalSection(&app->index_lock);
+            if (idle_cycles >= 4 && !name_index_ready) {
+                index_build_name_char_index(app);
+                idle_cycles = 0;
+            }
+        }
+        
+        for (int waited = 0;
+             waited < USN_MONITOR_INTERVAL_MS &&
+             app->monitor_running && !app->shutting_down;
+             waited += 50) {
+            Sleep(50);
         }
     }
     
@@ -934,6 +1012,12 @@ static DWORD WINAPI reindex_thread_proc(void *p)
     int indexed_volumes = 0;
     int failed_volumes = 0;
     
+    if (a->monitor_thread) {
+        WaitForSingleObject(a->monitor_thread, INFINITE);
+        CloseHandle(a->monitor_thread);
+        a->monitor_thread = NULL;
+    }
+    
     index_clear(a);
     a->indexed_volume_count = 0;
     a->index_error_count = 0;
@@ -966,6 +1050,7 @@ static DWORD WINAPI reindex_thread_proc(void *p)
     a->index_error_count = failed_volumes;
     index_build_paths(a);
     index_sort_entries_by_name(a);
+    index_build_ref_index(a);
     index_build_name_char_index(a);
     if (a->entry_count > 0)
         cache_save_index(a);
@@ -1475,10 +1560,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             {
                 int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
                 if (sel >= 0 && sel < app->filtered_count) {
-                    INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                    if (e && e->path && e->path[0]) {
-                        ShellExecuteW(hwnd, L"open", e->path, NULL, NULL, SW_SHOW);
-                    }
+                    wchar_t *path = NULL;
+                    if (ui_copy_entry_snapshot(app, sel, NULL, &path, NULL))
+                        ui_open_entry_path(hwnd, path);
+                    free(path);
                 }
                 break;
             }
@@ -1510,10 +1595,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 else if (kd->wVKey == VK_RETURN) {
                     int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
                     if (sel >= 0 && sel < app->filtered_count) {
-                        INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                        if (e && e->path && e->path[0]) {
-                            ShellExecuteW(hwnd, L"open", e->path, NULL, NULL, SW_SHOW);
-                        }
+                        wchar_t *path = NULL;
+                        if (ui_copy_entry_snapshot(app, sel, NULL, &path, NULL))
+                            ui_open_entry_path(hwnd, path);
+                        free(path);
                     }
                 }
                 break;
@@ -1673,12 +1758,21 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     {
         ui_queue_search(hwnd);
         ui_update_status(g_hwndStatus, app);
+        KillTimer(hwnd, IDT_STARTUP_SYNC);
+        SetTimer(hwnd, IDT_STARTUP_SYNC, STARTUP_SYNC_DELAY_MS, NULL);
         return 0;
     }
     
     case WM_INDEX_SYNCED:
     {
-        ui_queue_search(hwnd);
+        int identity;
+        EnterCriticalSection(&app->index_lock);
+        identity = app->filtered_identity;
+        LeaveCriticalSection(&app->index_lock);
+        if (identity)
+            ui_update_listview(g_hwndList, app);
+        else
+            ui_queue_search(hwnd);
         ui_update_status(g_hwndStatus, app);
         return 0;
     }
@@ -1703,6 +1797,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         }
         
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"  Indexing...");
+        KillTimer(hwnd, IDT_STARTUP_SYNC);
+        InterlockedExchange(&app->monitor_running, 0);
         InterlockedIncrement(&app->search_generation);
         app->filtered_count = 0;
         app->filtered_identity = 0;

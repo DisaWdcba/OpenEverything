@@ -318,8 +318,21 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
         DWORD bytes = 0;
         memset(&read, 0, sizeof(read));
         read.StartUsn = next_usn;
-        read.ReasonMask = 0xFFFFFFFF;
-        read.ReturnOnlyOnClose = 0;
+        read.ReasonMask = USN_REASON_DATA_OVERWRITE |
+                          USN_REASON_DATA_EXTEND |
+                          USN_REASON_DATA_TRUNCATION |
+                          USN_REASON_NAMED_DATA_OVERWRITE |
+                          USN_REASON_NAMED_DATA_EXTEND |
+                          USN_REASON_NAMED_DATA_TRUNCATION |
+                          USN_REASON_FILE_CREATE |
+                          USN_REASON_FILE_DELETE |
+                          USN_REASON_RENAME_OLD_NAME |
+                          USN_REASON_RENAME_NEW_NAME |
+                          USN_REASON_SECURITY_CHANGE |
+                          USN_REASON_INDEXABLE_CHANGE |
+                          USN_REASON_BASIC_INFO_CHANGE |
+                          USN_REASON_CLOSE;
+        read.ReturnOnlyOnClose = 1;
         read.Timeout = 0;
         read.BytesToWaitFor = 0;
         read.UsnJournalId = journal_id;
@@ -352,10 +365,6 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
                 ok = 0;
                 goto done;
             }
-            if (max_changes > 0 && change_count > max_changes) {
-                ok = 2;
-                goto done;
-            }
             
             offset += rec->RecordLength;
         }
@@ -366,6 +375,10 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
         }
         
         next_usn = returned_next_usn;
+        if (max_changes > 0 && change_count >= max_changes) {
+            ok = 1;
+            break;
+        }
         if (stop_usn > 0 && next_usn >= stop_usn) {
             ok = 1;
             break;
@@ -374,11 +387,6 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
     
 done:
     free(buffer);
-    
-    if (ok == 2) {
-        ntfs_free_usn_changes(changes, change_count);
-        return 2;
-    }
     
     if (!ok) {
         ntfs_free_usn_changes(changes, change_count);

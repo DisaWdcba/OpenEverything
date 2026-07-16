@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "config.h"
 #include "index.h"
+#include <io.h>
 
 #define CACHE_MAGIC "ECIDX3"
 #define CACHE_VERSION 3
@@ -207,6 +208,7 @@ static wchar_t *cache_copy_folded_to_pool(const wchar_t *text, unsigned int len,
 int cache_save_index(APP_STATE *app)
 {
     wchar_t path[MAX_PATH];
+    wchar_t temp_path[MAX_PATH];
     FILE *f = NULL;
     CACHE_HEADER header;
     VOLUME_INFO volumes[26];
@@ -214,8 +216,10 @@ int cache_save_index(APP_STATE *app)
     
     cache_get_index_path(path, MAX_PATH);
     cache_ensure_dir(path);
+    swprintf_s(temp_path, MAX_PATH, L"%s.tmp", path);
+    DeleteFileW(temp_path);
     
-    if (_wfopen_s(&f, path, L"wb") != 0 || !f)
+    if (_wfopen_s(&f, temp_path, L"wb") != 0 || !f)
         return 0;
     
     EnterCriticalSection(&app->index_lock);
@@ -275,10 +279,19 @@ int cache_save_index(APP_STATE *app)
         LeaveCriticalSection(&app->index_lock);
         Sleep(0);
     }
-    fclose(f);
+    if (ok && fflush(f) != 0)
+        ok = 0;
+    if (ok && _commit(_fileno(f)) != 0)
+        ok = 0;
+    if (fclose(f) != 0)
+        ok = 0;
+    f = NULL;
     
+    if (ok && !MoveFileExW(temp_path, path,
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        ok = 0;
     if (!ok)
-        DeleteFileW(path);
+        DeleteFileW(temp_path);
     
     return ok;
 }
@@ -304,6 +317,7 @@ int cache_load_index(APP_STATE *app)
     int *filtered = NULL;
     int *old_filtered = NULL;
     int old_entry_count = 0;
+    int load_capacity = 1;
     int ok = 1;
     
     memset(&header, 0, sizeof(header));
@@ -381,15 +395,23 @@ int cache_load_index(APP_STATE *app)
             string_chars += (size_t)ce.extension_len + 1;
             string_chars += (size_t)ce.name_len + 1;
             
-            if ((i & 8191) == 0)
-                Sleep(0);
         }
     }
     
     if (!ok)
         goto cleanup;
     
-    entries = (INDEX_ENTRY *)calloc(header.entry_count > 0 ? header.entry_count : 1, sizeof(INDEX_ENTRY));
+    if (header.entry_count > 0) {
+        int reserve = header.entry_count / 16;
+        if (reserve < 65536)
+            reserve = 65536;
+        if (header.entry_count <= INT_MAX - reserve)
+            load_capacity = header.entry_count + reserve;
+        else
+            load_capacity = header.entry_count;
+    }
+    
+    entries = (INDEX_ENTRY *)calloc(load_capacity, sizeof(INDEX_ENTRY));
     if (!entries) {
         ok = 0;
         goto cleanup;
@@ -441,15 +463,13 @@ int cache_load_index(APP_STATE *app)
         if (!e->name || !e->path || !e->extension || !e->folded_name)
             ok = 0;
         
-        if ((i & 4095) == 0)
-            Sleep(0);
     }
 
     if (!ok) {
         goto cleanup;
     }
     
-    filtered = (int *)calloc(header.entry_count > 0 ? header.entry_count : 1, sizeof(int));
+    filtered = (int *)calloc(load_capacity, sizeof(int));
     if (!filtered) {
         ok = 0;
         goto cleanup;
@@ -461,10 +481,11 @@ int cache_load_index(APP_STATE *app)
     old_filtered = app->filtered_indices;
     old_string_pool = app->entry_string_pool;
     index_clear_name_char_index(app);
+    index_clear_ref_index(app);
     
     app->entries = entries;
     app->entry_count = header.entry_count;
-    app->entry_capacity = header.entry_count > 0 ? header.entry_count : 1;
+    app->entry_capacity = load_capacity;
     app->filtered_indices = filtered;
     app->entry_string_pool = string_pool;
     app->filtered_count = 0;
@@ -474,6 +495,7 @@ int cache_load_index(APP_STATE *app)
     app->indexed_volume_count = header.volume_count;
     app->index_error_count = 0;
     app->cache_loaded = 1;
+    InterlockedIncrement(&app->index_revision);
     InterlockedIncrement(&app->search_generation);
     LeaveCriticalSection(&app->index_lock);
     

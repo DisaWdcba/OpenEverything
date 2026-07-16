@@ -383,6 +383,11 @@ typedef struct {
     int *name_char_indices[SEARCH_CHAR_SLOT_COUNT];
     int name_char_counts[SEARCH_CHAR_SLOT_COUNT];
     int name_char_index_ready;
+    unsigned long long *ref_index_keys;
+    int *ref_index_values;
+    int ref_index_capacity;
+    int ref_index_ready;
+    volatile LONG index_revision;
     void *entry_string_pool;
     int cache_loaded;
     CRITICAL_SECTION index_lock;
