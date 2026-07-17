@@ -887,6 +887,7 @@ static void ui_start_search(HWND hwnd)
     if (identity_result) {
         app->filtered_identity = 1;
         app->filtered_count = entry_count;
+        app->filtered_stale = 0;
         app->query = next_query;
     }
     LeaveCriticalSection(&app->index_lock);
@@ -907,7 +908,8 @@ static void ui_start_search(HWND hwnd)
     
     EnterCriticalSection(&app->index_lock);
     entry_count = app->entry_count;
-    if (ui_search_can_refine(&app->query, &next_query) && app->filtered_count > 0) {
+    if (!app->filtered_stale &&
+        ui_search_can_refine(&app->query, &next_query) && app->filtered_count > 0) {
         job->base_count = app->filtered_count;
         job->base_identity = app->filtered_identity;
         if (!job->base_identity) {
@@ -1870,6 +1872,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 memcpy(app->filtered_indices, job->results, job->result_count * sizeof(int));
                 app->filtered_count = job->result_count;
                 app->filtered_identity = 0;
+                app->filtered_stale = 0;
                 app->query = job->query;
                 accepted = 1;
             }
@@ -1978,6 +1981,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         InterlockedIncrement(&app->search_generation);
         app->filtered_count = 0;
         app->filtered_identity = 0;
+        app->filtered_stale = 0;
         ui_update_listview(g_hwndList, app);
         
         ctx = (struct ReindexCtx *)calloc(1, sizeof(struct ReindexCtx));

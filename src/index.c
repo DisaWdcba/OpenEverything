@@ -666,6 +666,7 @@ void index_clear(APP_STATE *app)
     app->entry_count = 0;
     app->filtered_count = 0;
     app->filtered_identity = 0;
+    app->filtered_stale = 0;
     free(app->entry_string_pool);
     app->entry_string_pool = NULL;
     InterlockedIncrement(&app->index_revision);
@@ -731,11 +732,34 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
 {
     int applied = 0;
     int names_changed = 0;
+    int has_deletes = 0;
+    int filtered_map_capacity = 0;
+    int filtered_rows_removed = 0;
+    int *filtered_positions = NULL;
     
     if (!changes || count <= 0)
         return 0;
     
+    for (int i = 0; i < count; i++) {
+        if (changes[i].reason & USN_REASON_FILE_DELETE) {
+            has_deletes = 1;
+            break;
+        }
+    }
+
     EnterCriticalSection(&app->index_lock);
+    if (has_deletes && !app->filtered_identity && app->filtered_count > 0) {
+        filtered_map_capacity = app->entry_count;
+        filtered_positions = (int *)calloc(
+            filtered_map_capacity > 0 ? filtered_map_capacity : 1, sizeof(int));
+        if (filtered_positions) {
+            for (int row = 0; row < app->filtered_count; row++) {
+                int entry_index = app->filtered_indices[row];
+                if (entry_index >= 0 && entry_index < filtered_map_capacity)
+                    filtered_positions[entry_index] = row + 1;
+            }
+        }
+    }
     
     for (int i = 0; i < count; i++) {
         USN_CHANGE *change = &changes[i];
@@ -744,6 +768,24 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
         if (change->reason & USN_REASON_FILE_DELETE) {
             if (idx >= 0) {
                 int last = app->entry_count - 1;
+                int removed_row = 0;
+                int moved_row = 0;
+                if (filtered_positions) {
+                    if (idx < filtered_map_capacity)
+                        removed_row = filtered_positions[idx];
+                    if (last < filtered_map_capacity)
+                        moved_row = filtered_positions[last];
+                    if (removed_row) {
+                        app->filtered_indices[removed_row - 1] = -1;
+                        filtered_rows_removed++;
+                    }
+                    if (idx != last && moved_row)
+                        app->filtered_indices[moved_row - 1] = idx;
+                    if (idx < filtered_map_capacity)
+                        filtered_positions[idx] = idx != last ? moved_row : 0;
+                    if (last < filtered_map_capacity)
+                        filtered_positions[last] = 0;
+                }
                 index_ref_remove_locked(app, change->volume_index, change->file_ref);
                 index_free_entry(&app->entries[idx]);
                 if (idx != last) {
@@ -854,11 +896,23 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
         }
     }
     
+    if (filtered_rows_removed > 0) {
+        int write_row = 0;
+        for (int read_row = 0; read_row < app->filtered_count; read_row++) {
+            int entry_index = app->filtered_indices[read_row];
+            if (entry_index >= 0)
+                app->filtered_indices[write_row++] = entry_index;
+        }
+        app->filtered_count = write_row;
+    }
+
     if (applied) {
-        if (app->filtered_identity)
+        if (app->filtered_identity) {
             app->filtered_count = app->entry_count;
-        else
-            app->filtered_count = 0;
+            app->filtered_stale = 0;
+        } else {
+            app->filtered_stale = 1;
+        }
         if (names_changed)
             index_clear_name_char_index(app);
         if (names_changed)
@@ -866,6 +920,7 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
     }
     
     LeaveCriticalSection(&app->index_lock);
+    free(filtered_positions);
     return applied;
 }
 

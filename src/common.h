@@ -381,6 +381,7 @@ typedef struct {
     int *filtered_indices;
     int filtered_count;
     int filtered_identity;
+    int filtered_stale;
     int *name_char_index_pool;
     int *name_char_indices[SEARCH_CHAR_SLOT_COUNT];
     int name_char_counts[SEARCH_CHAR_SLOT_COUNT];

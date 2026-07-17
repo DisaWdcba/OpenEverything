@@ -490,6 +490,7 @@ int cache_load_index(APP_STATE *app)
     app->entry_string_pool = string_pool;
     app->filtered_count = 0;
     app->filtered_identity = 0;
+    app->filtered_stale = 0;
     app->volume_count = header.volume_count;
     memcpy(app->volumes, volumes, sizeof(VOLUME_INFO) * header.volume_count);
     app->indexed_volume_count = header.volume_count;
