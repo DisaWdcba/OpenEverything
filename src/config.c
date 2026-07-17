@@ -44,6 +44,14 @@ void config_load(APP_STATE *app)
     app->use_regex = config_read_int(path, L"Search", L"UseRegex", 0);
     app->close_to_tray = config_read_int(path, L"UI", L"CloseToTray", 0);
     app->minimize_to_tray = config_read_int(path, L"UI", L"MinimizeToTray", 0);
+    app->column_width_name = config_read_int(path, L"Columns", L"Name", 380);
+    app->column_width_path = config_read_int(path, L"Columns", L"Path", 520);
+    app->column_width_size = config_read_int(path, L"Columns", L"Size", 96);
+    app->column_width_modified = config_read_int(path, L"Columns", L"DateModified", 150);
+    if (app->column_width_name < 40) app->column_width_name = 380;
+    if (app->column_width_path < 40) app->column_width_path = 520;
+    if (app->column_width_size < 40) app->column_width_size = 96;
+    if (app->column_width_modified < 40) app->column_width_modified = 150;
     
     /* Apply to query */
     app->query.match_case = app->match_case;
@@ -63,4 +71,8 @@ void config_save(APP_STATE *app)
     config_write_int(path, L"Search", L"UseRegex", app->use_regex);
     config_write_int(path, L"UI", L"CloseToTray", app->close_to_tray);
     config_write_int(path, L"UI", L"MinimizeToTray", app->minimize_to_tray);
+    config_write_int(path, L"Columns", L"Name", app->column_width_name);
+    config_write_int(path, L"Columns", L"Path", app->column_width_path);
+    config_write_int(path, L"Columns", L"Size", app->column_width_size);
+    config_write_int(path, L"Columns", L"DateModified", app->column_width_modified);
 }

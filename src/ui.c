@@ -28,6 +28,14 @@ static IContextMenu3 *g_shell_menu3;
 static volatile LONG g_reindexing = 0;
 static volatile LONG g_search_running = 0;
 static volatile LONG g_cache_loading = 0;
+static volatile LONG g_metadata_running = 0;
+static volatile LONG g_metadata_redraw_pending = 0;
+static int g_layout_timer_active;
+static int g_in_size_move;
+static HANDLE g_metadata_thread;
+static HANDLE g_metadata_event;
+static CRITICAL_SECTION g_metadata_queue_lock;
+static int g_metadata_queue_count;
 
 typedef struct {
     wchar_t *extension;
@@ -42,10 +50,12 @@ static int g_icon_cache_capacity;
 #define UI_SEARCH_HEIGHT 36
 #define IDT_SEARCH_DEBOUNCE 1
 #define IDT_STARTUP_SYNC 2
+#define IDT_LAYOUT 3
 #define SEARCH_DEBOUNCE_MS 120
 #define STARTUP_SYNC_DELAY_MS 2500
 #define USN_SYNC_MAX_CHANGES 16384
 #define USN_MONITOR_INTERVAL_MS 750
+#define METADATA_QUEUE_MAX 2048
 #define IDM_CTX_OPEN 20001
 #define IDM_CTX_OPEN_PATH 20002
 #define IDM_CTX_COPY_FULL_NAME 20003
@@ -80,6 +90,19 @@ struct OpenPathJob {
     int open_parent;
 };
 
+struct MetadataJob {
+    struct MetadataJob *next;
+    APP_STATE *app;
+    HWND hwnd;
+    wchar_t *path;
+    long long file_ref;
+    int volume_index;
+    int entry_index;
+    int is_directory;
+};
+
+static struct MetadataJob *g_metadata_queue_head;
+
 static void ui_init_visual_resources(void);
 static void ui_free_visual_resources(void);
 static void ui_format_count(wchar_t *buf, size_t buf_size, int value);
@@ -98,9 +121,12 @@ static int ui_append_shell_context_menu(HWND hwnd, HMENU menu, const wchar_t *pa
 static void ui_release_shell_menu_handlers(void);
 static void ui_invoke_shell_context_command(HWND hwnd, IContextMenu *menu,
                                             int cmd, POINT pt);
-static void ui_ensure_row_metadata(APP_STATE *app, int row);
+static void ui_queue_row_metadata(APP_STATE *app, int row);
+static int ui_start_metadata_worker(APP_STATE *app, HWND hwnd);
+static DWORD WINAPI ui_metadata_thread_proc(void *p);
 static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size);
 static void ui_queue_search(HWND hwnd);
+static void ui_apply_layout(HWND hwnd);
 static void ui_start_search(HWND hwnd);
 static void ui_start_cache_load(HWND hwnd);
 static int ui_search_can_refine(const SEARCH_QUERY *old_query, const SEARCH_QUERY *new_query);
@@ -280,71 +306,178 @@ static void ui_get_parent_path(const INDEX_ENTRY *entry, wchar_t *buf, size_t bu
         *last = L'\0';
 }
 
-static void ui_ensure_row_metadata(APP_STATE *app, int row)
+static void ui_reset_queued_metadata(APP_STATE *app, int entry_index,
+                                     long long file_ref, int volume_index)
 {
-    WIN32_FILE_ATTRIBUTE_DATA data;
-    ULARGE_INTEGER size;
+    EnterCriticalSection(&app->index_lock);
+    if (entry_index >= 0 && entry_index < app->entry_count) {
+        INDEX_ENTRY *entry = &app->entries[entry_index];
+        if (entry->file_ref == file_ref && entry->volume_index == volume_index)
+            entry->metadata_queued = 0;
+    }
+    LeaveCriticalSection(&app->index_lock);
+}
+
+static DWORD WINAPI ui_metadata_thread_proc(void *p)
+{
+    (void)p;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    
+    while (g_metadata_running) {
+        struct MetadataJob *job;
+        WIN32_FILE_ATTRIBUTE_DATA data;
+        ULARGE_INTEGER size;
+        int loaded;
+        int updated = 0;
+        
+        WaitForSingleObject(g_metadata_event, INFINITE);
+        if (!g_metadata_running)
+            break;
+        
+        for (;;) {
+            EnterCriticalSection(&g_metadata_queue_lock);
+            job = g_metadata_queue_head;
+            if (job) {
+                g_metadata_queue_head = job->next;
+                g_metadata_queue_count--;
+            }
+            LeaveCriticalSection(&g_metadata_queue_lock);
+            if (!job)
+                break;
+            
+            updated = 0;
+            memset(&data, 0, sizeof(data));
+            loaded = GetFileAttributesExW(job->path, GetFileExInfoStandard, &data) ? 1 : 0;
+            
+            EnterCriticalSection(&job->app->index_lock);
+            if (job->entry_index >= 0 && job->entry_index < job->app->entry_count) {
+                INDEX_ENTRY *entry = &job->app->entries[job->entry_index];
+                if (entry->file_ref == job->file_ref &&
+                    entry->volume_index == job->volume_index &&
+                    entry->path && wcscmp(entry->path, job->path) == 0) {
+                    if (loaded) {
+                        entry->attributes = data.dwFileAttributes;
+                        entry->creation_time = ((long long)data.ftCreationTime.dwHighDateTime << 32) |
+                                               data.ftCreationTime.dwLowDateTime;
+                        entry->modification_time = ((long long)data.ftLastWriteTime.dwHighDateTime << 32) |
+                                                   data.ftLastWriteTime.dwLowDateTime;
+                        entry->access_time = ((long long)data.ftLastAccessTime.dwHighDateTime << 32) |
+                                             data.ftLastAccessTime.dwLowDateTime;
+                        size.LowPart = data.nFileSizeLow;
+                        size.HighPart = data.nFileSizeHigh;
+                        entry->size = job->is_directory ? 0 : (long long)size.QuadPart;
+                    } else {
+                        entry->size = 0;
+                        entry->creation_time = 0;
+                        entry->modification_time = 0;
+                        entry->access_time = 0;
+                    }
+                    entry->metadata_loaded = 1;
+                    entry->metadata_queued = 0;
+                    updated = 1;
+                }
+            }
+            LeaveCriticalSection(&job->app->index_lock);
+            
+            if (updated &&
+                InterlockedCompareExchange(&g_metadata_redraw_pending, 1, 0) == 0) {
+                if (!PostMessageW(job->hwnd, WM_METADATA_READY, 0, 0))
+                    InterlockedExchange(&g_metadata_redraw_pending, 0);
+            }
+            free(job->path);
+            free(job);
+        }
+    }
+    return 0;
+}
+
+static int ui_start_metadata_worker(APP_STATE *app, HWND hwnd)
+{
+    (void)app;
+    (void)hwnd;
+    if (g_metadata_thread)
+        return 1;
+    
+    InitializeCriticalSection(&g_metadata_queue_lock);
+    g_metadata_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_metadata_event)
+        return 0;
+    InterlockedExchange(&g_metadata_running, 1);
+    g_metadata_thread = CreateThread(NULL, 0, ui_metadata_thread_proc, NULL, 0, NULL);
+    if (!g_metadata_thread) {
+        InterlockedExchange(&g_metadata_running, 0);
+        CloseHandle(g_metadata_event);
+        g_metadata_event = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static void ui_queue_row_metadata(APP_STATE *app, int row)
+{
+    struct MetadataJob *job = NULL;
+    INDEX_ENTRY *entry;
     wchar_t *path = NULL;
-    int is_directory = 0;
-    int idx = -1;
     long long file_ref = 0;
     int volume_index = -1;
-    int loaded = 0;
+    int entry_index = -1;
+    int is_directory = 0;
+    int queue_full = 0;
     
-    if (!app || row < 0)
+    if (!app || row < 0 || !g_metadata_running || !g_metadata_event)
         return;
     
     EnterCriticalSection(&app->index_lock);
-    if (row >= 0 && row < app->filtered_count) {
-        idx = app->filtered_identity ? row : app->filtered_indices[row];
-        if (idx >= 0 && idx < app->entry_count) {
-            INDEX_ENTRY *entry = &app->entries[idx];
-            loaded = entry->metadata_loaded;
-            is_directory = entry->is_directory;
-            file_ref = entry->file_ref;
-            volume_index = entry->volume_index;
-            if (!loaded && entry->path && entry->path[0])
-                path = _wcsdup(entry->path);
-        }
-    }
-    LeaveCriticalSection(&app->index_lock);
-    
-    if (loaded || !path)
+    entry = ui_entry_from_row(app, row);
+    if (!entry || entry->metadata_loaded || entry->metadata_queued ||
+        !entry->path || !entry->path[0]) {
+        LeaveCriticalSection(&app->index_lock);
         return;
-    
-    memset(&data, 0, sizeof(data));
-    loaded = GetFileAttributesExW(path, GetFileExInfoStandard, &data) ? 1 : 0;
-    
-    EnterCriticalSection(&app->index_lock);
-    if (idx >= 0 && idx < app->entry_count) {
-        INDEX_ENTRY *entry = &app->entries[idx];
-        if (entry->file_ref == file_ref &&
-            entry->volume_index == volume_index &&
-            entry->path && wcscmp(entry->path, path) == 0) {
-            if (loaded) {
-                entry->attributes = data.dwFileAttributes;
-                entry->creation_time = ((long long)data.ftCreationTime.dwHighDateTime << 32) |
-                                       data.ftCreationTime.dwLowDateTime;
-                entry->modification_time = ((long long)data.ftLastWriteTime.dwHighDateTime << 32) |
-                                           data.ftLastWriteTime.dwLowDateTime;
-                entry->access_time = ((long long)data.ftLastAccessTime.dwHighDateTime << 32) |
-                                     data.ftLastAccessTime.dwLowDateTime;
-                
-                size.LowPart = data.nFileSizeLow;
-                size.HighPart = data.nFileSizeHigh;
-                entry->size = is_directory ? 0 : (long long)size.QuadPart;
-            } else {
-                entry->size = 0;
-                entry->creation_time = 0;
-                entry->modification_time = 0;
-                entry->access_time = 0;
-            }
-            entry->metadata_loaded = 1;
-        }
     }
+    path = _wcsdup(entry->path);
+    if (!path) {
+        LeaveCriticalSection(&app->index_lock);
+        return;
+    }
+    file_ref = entry->file_ref;
+    volume_index = entry->volume_index;
+    entry_index = (int)(entry - app->entries);
+    is_directory = entry->is_directory;
+    entry->metadata_queued = 1;
     LeaveCriticalSection(&app->index_lock);
     
-    free(path);
+    job = (struct MetadataJob *)calloc(1, sizeof(*job));
+    if (!job) {
+        ui_reset_queued_metadata(app, entry_index, file_ref, volume_index);
+        free(path);
+        return;
+    }
+    job->path = path;
+    job->app = app;
+    job->hwnd = app->hwnd_main;
+    job->file_ref = file_ref;
+    job->volume_index = volume_index;
+    job->entry_index = entry_index;
+    job->is_directory = is_directory;
+    
+    EnterCriticalSection(&g_metadata_queue_lock);
+    if (g_metadata_queue_count >= METADATA_QUEUE_MAX) {
+        queue_full = 1;
+    } else {
+        job->next = g_metadata_queue_head;
+        g_metadata_queue_head = job;
+        g_metadata_queue_count++;
+    }
+    LeaveCriticalSection(&g_metadata_queue_lock);
+    
+    if (queue_full) {
+        ui_reset_queued_metadata(app, job->entry_index,
+                                 job->file_ref, job->volume_index);
+        free(job->path);
+        free(job);
+        return;
+    }
+    SetEvent(g_metadata_event);
 }
 
 static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size)
@@ -1122,7 +1255,13 @@ void ui_update_listview(HWND hwndList, APP_STATE *app)
 {
     int count = app->filtered_count;
     ListView_SetItemCountEx(hwndList, count, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
-    InvalidateRect(hwndList, NULL, TRUE);
+    InvalidateRect(hwndList, NULL, FALSE);
+}
+
+static void ui_update_listview_count(HWND hwndList, APP_STATE *app)
+{
+    ListView_SetItemCountEx(hwndList, app->filtered_count,
+                            LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
 }
 
 void ui_update_status(HWND hwndStatus, APP_STATE *app)
@@ -1142,6 +1281,40 @@ void ui_update_status(HWND hwndStatus, APP_STATE *app)
         swprintf_s(buf, 256, L"%s objects (%s total)", filtered, total);
     }
     SendMessageW(hwndStatus, SB_SETTEXTW, 0, (LPARAM)buf);
+}
+
+static void ui_apply_layout(HWND hwnd)
+{
+    RECT rc;
+    RECT rc_status;
+    HDWP positions;
+    int status_h = 22;
+    int list_top = UI_SEARCH_TOP + UI_SEARCH_HEIGHT;
+    
+    if (!g_hwndSearch || !g_hwndList || !g_hwndStatus)
+        return;
+    GetClientRect(hwnd, &rc);
+    SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
+    GetWindowRect(g_hwndStatus, &rc_status);
+    status_h = rc_status.bottom - rc_status.top;
+    if (status_h <= 0)
+        status_h = 22;
+    
+    positions = BeginDeferWindowPos(2);
+    if (!positions)
+        return;
+    positions = DeferWindowPos(positions, g_hwndSearch, NULL,
+                               4, UI_SEARCH_TOP,
+                               rc.right - 8, UI_SEARCH_HEIGHT - 8,
+                               SWP_NOZORDER | SWP_NOACTIVATE);
+    if (positions) {
+        positions = DeferWindowPos(positions, g_hwndList, NULL,
+                                   0, list_top,
+                                   rc.right, rc.bottom - list_top - status_h,
+                                   SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (positions)
+        EndDeferWindowPos(positions);
 }
 
 /* =============================================================
@@ -1260,10 +1433,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         LVCOLUMNW col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         
-        col.pszText = L"Name";          col.cx = 380; col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
-        col.pszText = L"Path";          col.cx = 520; col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
-        col.pszText = L"Size";          col.cx = 96;  col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
-        col.pszText = L"Date Modified"; col.cx = 150; col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
+        col.pszText = L"Name";          col.cx = app->column_width_name;     col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
+        col.pszText = L"Path";          col.cx = app->column_width_path;     col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
+        col.pszText = L"Size";          col.cx = app->column_width_size;     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
+        col.pszText = L"Date Modified"; col.cx = app->column_width_modified; col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
         col.pszText = L"Date Created";  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
         col.pszText = L"Attributes";    col.cx = 0;   col.iSubItem = 5; ListView_InsertColumn(g_hwndList, 5, &col);
         
@@ -1284,6 +1457,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         app->hwnd_search = g_hwndSearch;
         app->hwnd_list = g_hwndList;
         app->hwnd_status = g_hwndStatus;
+        ui_start_metadata_worker(app, hwnd);
         
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Loading index cache...");
         ui_start_cache_load(hwnd);
@@ -1292,46 +1466,26 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     }
     
     /* ---- Window sizing ---- */
-    case WM_SIZE:
-    {
-        RECT rc;
-        RECT rcStatus;
-        int status_h = 22;
-        int list_top = UI_SEARCH_TOP + UI_SEARCH_HEIGHT;
-        
-        GetClientRect(hwnd, &rc);
-        
-        /* Status bar */
-        SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
-        GetWindowRect(g_hwndStatus, &rcStatus);
-        status_h = rcStatus.bottom - rcStatus.top;
-        if (status_h <= 0) status_h = 22;
-        
-        SetWindowPos(g_hwndSearch, NULL, 4, UI_SEARCH_TOP,
-                     rc.right - 8, UI_SEARCH_HEIGHT - 8, SWP_NOZORDER);
-        
-        /* List view */
-        SetWindowPos(g_hwndList, NULL, 0, list_top,
-                     rc.right, rc.bottom - list_top - status_h,
-                     SWP_NOZORDER);
-        
-        /* Resize list columns proportionally */
-        int total_width = rc.right - GetSystemMetrics(SM_CXVSCROLL);
-        int size_width = 96;
-        int modified_width = 150;
-        int text_width;
-        if (total_width < 500) total_width = 500;
-        text_width = total_width - size_width - modified_width;
-        if (text_width < 260) text_width = 260;
-        ListView_SetColumnWidth(g_hwndList, 0, text_width * 40 / 100);
-        ListView_SetColumnWidth(g_hwndList, 1, text_width - (text_width * 40 / 100));
-        ListView_SetColumnWidth(g_hwndList, 2, size_width);
-        ListView_SetColumnWidth(g_hwndList, 3, modified_width);
-        ListView_SetColumnWidth(g_hwndList, 4, 0);
-        ListView_SetColumnWidth(g_hwndList, 5, 0);
-        
+    case WM_ENTERSIZEMOVE:
+        g_in_size_move = 1;
         return 0;
-    }
+    
+    case WM_SIZE:
+        if (!g_layout_timer_active) {
+            g_layout_timer_active = SetTimer(hwnd, IDT_LAYOUT, 16, NULL) != 0;
+            if (!g_layout_timer_active)
+                ui_apply_layout(hwnd);
+        }
+        return 0;
+    
+    case WM_EXITSIZEMOVE:
+        KillTimer(hwnd, IDT_LAYOUT);
+        g_layout_timer_active = 0;
+        ui_apply_layout(hwnd);
+        g_in_size_move = 0;
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        return 0;
     
     /* ---- Menu and command handling ---- */
     case WM_COMMAND:
@@ -1469,6 +1623,12 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     }
     
     case WM_TIMER:
+        if (wParam == IDT_LAYOUT) {
+            KillTimer(hwnd, IDT_LAYOUT);
+            g_layout_timer_active = 0;
+            ui_apply_layout(hwnd);
+            return 0;
+        }
         if (wParam == IDT_SEARCH_DEBOUNCE) {
             KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
             ui_start_search(hwnd);
@@ -1502,7 +1662,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                      di->item.iSubItem == COL_DATE_MODIFIED ||
                      di->item.iSubItem == COL_DATE_CREATED ||
                      di->item.iSubItem == COL_ATTRIBUTES)) {
-                    ui_ensure_row_metadata(app, di->item.iItem);
+                    ui_queue_row_metadata(app, di->item.iItem);
                 }
                 
                 EnterCriticalSection(&app->index_lock);
@@ -1737,6 +1897,22 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         return 0;
     }
     
+    case WM_METADATA_READY:
+    {
+        int top;
+        int last;
+        int item_count;
+        InterlockedExchange(&g_metadata_redraw_pending, 0);
+        item_count = ListView_GetItemCount(g_hwndList);
+        top = ListView_GetTopIndex(g_hwndList);
+        last = top + ListView_GetCountPerPage(g_hwndList) + 1;
+        if (last >= item_count)
+            last = item_count - 1;
+        if (!g_in_size_move && top >= 0 && last >= top)
+            ListView_RedrawItems(g_hwndList, top, last);
+        return 0;
+    }
+    
     case WM_INDEX_PROGRESS:
     {
         int pct = (int)wParam;
@@ -1770,7 +1946,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         identity = app->filtered_identity;
         LeaveCriticalSection(&app->index_lock);
         if (identity)
-            ui_update_listview(g_hwndList, app);
+            ui_update_listview_count(g_hwndList, app);
         else
             ui_queue_search(hwnd);
         ui_update_status(g_hwndStatus, app);
@@ -1827,10 +2003,20 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     
     /* ---- Window close/destroy ---- */
     case WM_CLOSE:
+        if (g_hwndList) {
+            app->column_width_name = ListView_GetColumnWidth(g_hwndList, 0);
+            app->column_width_path = ListView_GetColumnWidth(g_hwndList, 1);
+            app->column_width_size = ListView_GetColumnWidth(g_hwndList, 2);
+            app->column_width_modified = ListView_GetColumnWidth(g_hwndList, 3);
+        }
         config_save(app);
         InterlockedExchange(&app->shutting_down, 1);
+        InterlockedExchange(&g_metadata_running, 0);
+        if (g_metadata_event)
+            SetEvent(g_metadata_event);
         KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
         KillTimer(hwnd, IDT_STARTUP_SYNC);
+        KillTimer(hwnd, IDT_LAYOUT);
         InterlockedIncrement(&app->search_generation);
         InterlockedExchange(&g_cache_loading, 0);
         InterlockedExchange(&app->monitor_running, 0);

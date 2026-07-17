@@ -98,6 +98,7 @@
 #define WM_SEARCH_DONE                   (WM_USER + 104)
 #define WM_INDEX_SYNCED                  (WM_USER + 105)
 #define WM_CACHE_LOADED                  (WM_USER + 106)
+#define WM_METADATA_READY                (WM_USER + 107)
 
 /* Column indices */
 #define COL_NAME                         0
@@ -320,6 +321,7 @@ typedef struct {
     int is_directory;
     int volume_index;
     int metadata_loaded;
+    int metadata_queued;
 } INDEX_ENTRY;
 
 typedef struct {
@@ -418,6 +420,10 @@ typedef struct {
     int use_regex;
     int close_to_tray;
     int minimize_to_tray;
+    int column_width_name;
+    int column_width_path;
+    int column_width_size;
+    int column_width_modified;
 } APP_STATE;
 
 extern APP_STATE g_app;
