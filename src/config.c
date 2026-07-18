@@ -58,6 +58,8 @@ void config_load(APP_STATE *app)
     app->query.match_whole_word = app->match_whole_word;
     app->query.match_path = app->match_path;
     app->query.use_regex = app->use_regex;
+    app->query.sort_column = COL_NAME;
+    app->query.sort_ascending = 1;
 }
 
 void config_save(APP_STATE *app)

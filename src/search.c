@@ -224,7 +224,13 @@ static int compare_filtered_indices_ctx(void *ctx, const void *lhs, const void *
     int ib = *(const int *)rhs;
     INDEX_ENTRY *a = &sort->app->entries[ia];
     INDEX_ENTRY *b = &sort->app->entries[ib];
-    int result = compare_entries_for_query(a, b, sort->query->sort_column);
+    int result;
+
+    /* Keep directories together at the top for every sort direction. */
+    if (a->is_directory != b->is_directory)
+        return a->is_directory ? -1 : 1;
+
+    result = compare_entries_for_query(a, b, sort->query->sort_column);
     
     return sort->query->sort_ascending ? result : -result;
 }
@@ -350,8 +356,6 @@ void search_sort_indices(APP_STATE *app, const SEARCH_QUERY *query, int *indices
     
     if (count <= 1)
         return;
-    if (query->sort_column == COL_NAME && query->sort_ascending)
-        return;
     
     ctx.app = app;
     ctx.query = query;
@@ -404,11 +408,9 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
         count = limit;
         if (generation != app->search_generation)
             return count;
-        if (!(query->sort_column == COL_NAME && query->sort_ascending)) {
-            EnterCriticalSection(&app->index_lock);
-            search_sort_indices(app, query, out_indices, count);
-            LeaveCriticalSection(&app->index_lock);
-        }
+        EnterCriticalSection(&app->index_lock);
+        search_sort_indices(app, query, out_indices, count);
+        LeaveCriticalSection(&app->index_lock);
         return count;
     }
     
@@ -513,7 +515,7 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
     if (generation != app->search_generation)
         return count;
     
-    if (!(query->sort_column == COL_NAME && query->sort_ascending)) {
+    {
         int valid_count = 0;
         int entry_count;
         

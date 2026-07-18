@@ -11,6 +11,8 @@
 static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK search_edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                           UINT_PTR subclass_id, DWORD_PTR ref_data);
+static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                       UINT_PTR subclass_id, DWORD_PTR ref_data);
 
 static HINSTANCE g_hInst;
 static HWND g_hwndSearch;
@@ -30,8 +32,8 @@ static volatile LONG g_search_running = 0;
 static volatile LONG g_cache_loading = 0;
 static volatile LONG g_metadata_running = 0;
 static volatile LONG g_metadata_redraw_pending = 0;
-static int g_layout_timer_active;
 static int g_in_size_move;
+static int g_in_scroll_thumb;
 static HANDLE g_metadata_thread;
 static HANDLE g_metadata_event;
 static CRITICAL_SECTION g_metadata_queue_lock;
@@ -50,7 +52,6 @@ static int g_icon_cache_capacity;
 #define UI_SEARCH_HEIGHT 36
 #define IDT_SEARCH_DEBOUNCE 1
 #define IDT_STARTUP_SYNC 2
-#define IDT_LAYOUT 3
 #define SEARCH_DEBOUNCE_MS 120
 #define STARTUP_SYNC_DELAY_MS 2500
 #define USN_SYNC_MAX_CHANGES 16384
@@ -127,6 +128,9 @@ static DWORD WINAPI ui_metadata_thread_proc(void *p);
 static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size);
 static void ui_queue_search(HWND hwnd);
 static void ui_apply_layout(HWND hwnd);
+static void ui_hide_horizontal_scrollbar(HWND hwndList);
+static void ui_update_sort_indicator(HWND hwndList, int column, int ascending);
+static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_same);
 static void ui_start_search(HWND hwnd);
 static void ui_start_cache_load(HWND hwnd);
 static int ui_search_can_refine(const SEARCH_QUERY *old_query, const SEARCH_QUERY *new_query);
@@ -863,7 +867,6 @@ static void ui_start_search(HWND hwnd)
     HANDLE thread;
     int entry_count;
     SEARCH_QUERY next_query;
-    int identity_result = 0;
     int search_limit;
     
     if (!app || InterlockedCompareExchange(&g_search_running, 1, 0) != 0)
@@ -881,24 +884,7 @@ static void ui_start_search(HWND hwnd)
     
     EnterCriticalSection(&app->index_lock);
     entry_count = app->entry_count;
-    identity_result = (!next_query.text[0] &&
-                       next_query.sort_column == COL_NAME &&
-                       next_query.sort_ascending);
-    if (identity_result) {
-        app->filtered_identity = 1;
-        app->filtered_count = entry_count;
-        app->filtered_stale = 0;
-        app->query = next_query;
-    }
     LeaveCriticalSection(&app->index_lock);
-    
-    if (identity_result) {
-        app->is_searching = 0;
-        InterlockedExchange(&g_search_running, 0);
-        ui_update_listview(g_hwndList, app);
-        ui_update_status(g_hwndStatus, app);
-        return;
-    }
     
     job = (struct SearchJob *)calloc(1, sizeof(struct SearchJob));
     if (!job) {
@@ -1204,7 +1190,7 @@ int ui_init(HINSTANCE hInst)
     
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = 0;
     wc.lpfnWndProc = everything_wndproc;
     wc.cbClsExtra = 0;
     wc.cbWndExtra = 0;
@@ -1257,6 +1243,7 @@ void ui_update_listview(HWND hwndList, APP_STATE *app)
 {
     int count = app->filtered_count;
     ListView_SetItemCountEx(hwndList, count, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+    ui_hide_horizontal_scrollbar(hwndList);
     InvalidateRect(hwndList, NULL, FALSE);
 }
 
@@ -1264,6 +1251,7 @@ static void ui_update_listview_count(HWND hwndList, APP_STATE *app)
 {
     ListView_SetItemCountEx(hwndList, app->filtered_count,
                             LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+    ui_hide_horizontal_scrollbar(hwndList);
 }
 
 void ui_update_status(HWND hwndStatus, APP_STATE *app)
@@ -1317,6 +1305,55 @@ static void ui_apply_layout(HWND hwnd)
     }
     if (positions)
         EndDeferWindowPos(positions);
+    ui_hide_horizontal_scrollbar(g_hwndList);
+}
+
+static void ui_hide_horizontal_scrollbar(HWND hwndList)
+{
+    if (hwndList)
+        ShowScrollBar(hwndList, SB_HORZ, FALSE);
+}
+
+static void ui_update_sort_indicator(HWND hwndList, int column, int ascending)
+{
+    HWND header;
+    int count;
+
+    if (!hwndList)
+        return;
+    header = ListView_GetHeader(hwndList);
+    if (!header)
+        return;
+
+    count = Header_GetItemCount(header);
+    for (int i = 0; i < count; i++) {
+        HDITEMW item;
+        memset(&item, 0, sizeof(item));
+        item.mask = HDI_FORMAT;
+        if (!SendMessageW(header, HDM_GETITEMW, i, (LPARAM)&item))
+            continue;
+        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == column)
+            item.fmt |= ascending ? HDF_SORTUP : HDF_SORTDOWN;
+        SendMessageW(header, HDM_SETITEMW, i, (LPARAM)&item);
+    }
+}
+
+static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_same)
+{
+    if (!app || column < COL_NAME || column > COL_ATTRIBUTES)
+        return;
+
+    if (toggle_same && app->query.sort_column == column)
+        app->query.sort_ascending = !app->query.sort_ascending;
+    else {
+        app->query.sort_column = column;
+        app->query.sort_ascending = 1;
+    }
+
+    ui_update_sort_indicator(g_hwndList, app->query.sort_column,
+                             app->query.sort_ascending);
+    ui_queue_search(hwnd);
 }
 
 /* =============================================================
@@ -1419,6 +1456,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             0, UI_SEARCH_TOP + UI_SEARCH_HEIGHT, rc.right,
             rc.bottom - UI_SEARCH_TOP - UI_SEARCH_HEIGHT - 22,
             hwnd, (HMENU)IDC_LISTVIEW, cs->hInstance, NULL);
+        SetWindowSubclass(g_hwndList, list_view_proc, 1, 0);
         
         /* Enable double buffering */
         ListView_SetExtendedListViewStyleEx(g_hwndList,
@@ -1444,6 +1482,9 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         
         /* Add extension column (hidden) */
         col.pszText = L"Extension";     col.cx = 0;   col.iSubItem = 6; ListView_InsertColumn(g_hwndList, 6, &col);
+        ui_update_sort_indicator(g_hwndList, app->query.sort_column,
+                                 app->query.sort_ascending);
+        ui_hide_horizontal_scrollbar(g_hwndList);
         
         /* Set font */
         SendMessageW(g_hwndSearch, WM_SETFONT, (WPARAM)g_font_search, TRUE);
@@ -1473,16 +1514,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         return 0;
     
     case WM_SIZE:
-        if (!g_layout_timer_active) {
-            g_layout_timer_active = SetTimer(hwnd, IDT_LAYOUT, 16, NULL) != 0;
-            if (!g_layout_timer_active)
-                ui_apply_layout(hwnd);
-        }
+        ui_apply_layout(hwnd);
         return 0;
     
     case WM_EXITSIZEMOVE:
-        KillTimer(hwnd, IDT_LAYOUT);
-        g_layout_timer_active = 0;
         ui_apply_layout(hwnd);
         g_in_size_move = 0;
         RedrawWindow(hwnd, NULL, NULL,
@@ -1587,16 +1622,12 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             ui_queue_search(hwnd);
             break;
             
-        case IDM_VIEW_SORT_NAME:       app->query.sort_column = COL_NAME;          goto do_sort;
-        case IDM_VIEW_SORT_PATH:       app->query.sort_column = COL_PATH;          goto do_sort;
-        case IDM_VIEW_SORT_SIZE:       app->query.sort_column = COL_SIZE;          goto do_sort;
-        case IDM_VIEW_SORT_DATE_MODIFIED: app->query.sort_column = COL_DATE_MODIFIED; goto do_sort;
-        case IDM_VIEW_SORT_DATE_CREATED:  app->query.sort_column = COL_DATE_CREATED;  goto do_sort;
-        case IDM_VIEW_SORT_ATTRIBUTES: app->query.sort_column = COL_ATTRIBUTES;    goto do_sort;
-        
-        do_sort:
-            ui_queue_search(hwnd);
-            break;
+        case IDM_VIEW_SORT_NAME:          ui_change_sort(hwnd, app, COL_NAME, 1);          break;
+        case IDM_VIEW_SORT_PATH:          ui_change_sort(hwnd, app, COL_PATH, 1);          break;
+        case IDM_VIEW_SORT_SIZE:          ui_change_sort(hwnd, app, COL_SIZE, 1);          break;
+        case IDM_VIEW_SORT_DATE_MODIFIED: ui_change_sort(hwnd, app, COL_DATE_MODIFIED, 1); break;
+        case IDM_VIEW_SORT_DATE_CREATED:  ui_change_sort(hwnd, app, COL_DATE_CREATED, 1);  break;
+        case IDM_VIEW_SORT_ATTRIBUTES:    ui_change_sort(hwnd, app, COL_ATTRIBUTES, 1);    break;
         
         case IDM_VIEW_REFRESH:
         case IDM_INDEX_UPDATE:
@@ -1625,12 +1656,6 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     }
     
     case WM_TIMER:
-        if (wParam == IDT_LAYOUT) {
-            KillTimer(hwnd, IDT_LAYOUT);
-            g_layout_timer_active = 0;
-            ui_apply_layout(hwnd);
-            return 0;
-        }
         if (wParam == IDT_SEARCH_DEBOUNCE) {
             KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
             ui_start_search(hwnd);
@@ -1649,6 +1674,13 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         NMHDR *nm = (NMHDR *)lParam;
         if (nm->idFrom == IDC_LISTVIEW) {
             switch (nm->code) {
+            case LVN_COLUMNCLICK:
+            {
+                NMLISTVIEW *click = (NMLISTVIEW *)lParam;
+                ui_change_sort(hwnd, app, click->iSubItem, 1);
+                break;
+            }
+
             case LVN_GETDISPINFOW:
             {
                 NMLVDISPINFOW *di = (NMLVDISPINFOW *)lParam;
@@ -1659,7 +1691,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 int icon_is_dir = 0;
                 icon_ext[0] = L'\0';
                 
-                if ((di->item.mask & LVIF_TEXT) &&
+                if (!g_in_scroll_thumb && (di->item.mask & LVIF_TEXT) &&
                     (di->item.iSubItem == COL_SIZE ||
                      di->item.iSubItem == COL_DATE_MODIFIED ||
                      di->item.iSubItem == COL_DATE_CREATED ||
@@ -1713,8 +1745,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 
                 LeaveCriticalSection(&app->index_lock);
                 
-                if (has_entry && (di->item.mask & LVIF_IMAGE))
-                    di->item.iImage = ui_icon_for_type(icon_is_dir, icon_ext);
+                if (has_entry && (di->item.mask & LVIF_IMAGE)) {
+                    di->item.iImage = g_in_scroll_thumb
+                        ? (icon_is_dir ? g_icon_folder : g_icon_file)
+                        : ui_icon_for_type(icon_is_dir, icon_ext);
+                }
                 break;
             }
             
@@ -2020,7 +2055,6 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             SetEvent(g_metadata_event);
         KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
         KillTimer(hwnd, IDT_STARTUP_SYNC);
-        KillTimer(hwnd, IDT_LAYOUT);
         InterlockedIncrement(&app->search_generation);
         InterlockedExchange(&g_cache_loading, 0);
         InterlockedExchange(&app->monitor_running, 0);
@@ -2072,5 +2106,55 @@ static LRESULT CALLBACK search_edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     
     }
     
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                       UINT_PTR subclass_id, DWORD_PTR ref_data)
+{
+    LRESULT result;
+    int scroll_code;
+
+    (void)ref_data;
+
+    switch (msg) {
+    case WM_VSCROLL:
+        scroll_code = LOWORD(wParam);
+        if (scroll_code == SB_THUMBTRACK)
+            g_in_scroll_thumb = 1;
+
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+
+        if (scroll_code == SB_ENDSCROLL && g_in_scroll_thumb) {
+            g_in_scroll_thumb = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        ui_hide_horizontal_scrollbar(hwnd);
+        return result;
+
+    case WM_HSCROLL:
+        ui_hide_horizontal_scrollbar(hwnd);
+        return 0;
+
+    case WM_SIZE:
+    case WM_NOTIFY:
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+        ui_hide_horizontal_scrollbar(hwnd);
+        return result;
+
+    case WM_CAPTURECHANGED:
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+        if (g_in_scroll_thumb) {
+            g_in_scroll_thumb = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return result;
+
+    case WM_NCDESTROY:
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+        RemoveWindowSubclass(hwnd, list_view_proc, subclass_id);
+        return result;
+    }
+
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
