@@ -78,18 +78,19 @@
 /* Search types */
 #define SEARCH_MAX_RESULTS               100000
 #define SEARCH_CHAR_SLOT_COUNT           40
+#define SEARCH_FOLDER_SCOPE_MAX          1024
 
 /* Entry string ownership flags */
 #define ENTRY_STRING_NAME_POOLED         0x01
-#define ENTRY_STRING_PATH_POOLED         0x02
-#define ENTRY_STRING_EXTENSION_POOLED    0x04
-#define ENTRY_STRING_FOLDED_NAME_POOLED  0x08
 
 /* UI constants */
 #define WC_EVERYTHING                    L"OPENEVERYTHING"
 #define IDC_SEARCH_EDIT                  10007
 #define IDC_LISTVIEW                     10020
 #define IDC_STATUS_BAR                   10021
+#define IDC_FOLDER_TREE                  10022
+#define IDC_FILTER_LIST                  10023
+#define IDC_SUBFOLDERS                   10024
 
 #define WM_SEARCH_UPDATE                 (WM_USER + 100)
 #define WM_INDEX_PROGRESS                (WM_USER + 101)
@@ -99,6 +100,8 @@
 #define WM_INDEX_SYNCED                  (WM_USER + 105)
 #define WM_CACHE_LOADED                  (WM_USER + 106)
 #define WM_METADATA_READY                (WM_USER + 107)
+#define WM_FOLDER_ENUM_READY             (WM_USER + 108)
+#define WM_CACHE_UPGRADE_DONE            (WM_USER + 109)
 
 /* Column indices */
 #define COL_NAME                         0
@@ -124,10 +127,38 @@
 #define IDM_VIEW_SORT_DATE_MODIFIED      10043
 #define IDM_VIEW_SORT_DATE_CREATED       10044
 #define IDM_VIEW_SORT_ATTRIBUTES         10045
+#define IDM_VIEW_FOLDERS                 10046
+#define IDM_VIEW_FILTERS                 10047
+#define IDM_VIEW_THEME_LIGHT             10090
+#define IDM_VIEW_THEME_DARK              10091
+#define IDM_VIEW_THEME_SYSTEM            10092
 #define IDM_INDEX_UPDATE                 10050
 #define IDM_INDEX_REBUILD                10051
 #define IDM_HELP_ABOUT                   10060
 #define ID_TOOLBAR_REFRESH               11001
+
+typedef enum {
+    FILTER_EVERYTHING = 0,
+    FILTER_AUDIO,
+    FILTER_COMPRESSED,
+    FILTER_DOCUMENT,
+    FILTER_EXECUTABLE,
+    FILTER_FOLDER,
+    FILTER_IMAGE,
+    FILTER_VIDEO,
+    FILTER_COUNT
+} FILTER_TYPE;
+
+typedef enum {
+    THEME_SYSTEM = 0,
+    THEME_LIGHT,
+    THEME_DARK
+} THEME_MODE;
+
+typedef enum {
+    PANEL_DOCK_LEFT = 0,
+    PANEL_DOCK_RIGHT
+} PANEL_DOCK_SIDE;
 
 /* IPC constants */
 #define IPC_PIPE_NAME                   L"\\\\.\\pipe\\OpenEverything"
@@ -304,24 +335,19 @@ typedef struct {
 /* Index entry structure */
 typedef struct {
     wchar_t *name;
-    long long usn;
-    wchar_t *path;
-    wchar_t *extension;
-    wchar_t *folded_name;
-    unsigned int string_flags;
     unsigned long long name_char_mask;
-    unsigned long long path_char_mask;
     long long size;
     long long creation_time;
     long long modification_time;
-    long long access_time;
     unsigned int attributes;
     long long file_ref;
     long long parent_ref;
-    int is_directory;
-    int volume_index;
-    int metadata_loaded;
-    int metadata_queued;
+    unsigned char string_flags;
+    unsigned char filter_type;
+    unsigned char is_directory;
+    signed char volume_index;
+    unsigned char metadata_loaded;
+    unsigned char metadata_queued;
 } INDEX_ENTRY;
 
 typedef struct {
@@ -361,6 +387,9 @@ typedef struct {
     int match_whole_word;
     int match_path;
     int use_regex;
+    int filter_id;
+    wchar_t folder_scope[SEARCH_FOLDER_SCOPE_MAX];
+    int include_subfolders;
     int sort_column;
     int sort_ascending;
 } SEARCH_QUERY;
@@ -386,6 +415,10 @@ typedef struct {
     int *name_char_indices[SEARCH_CHAR_SLOT_COUNT];
     int name_char_counts[SEARCH_CHAR_SLOT_COUNT];
     int name_char_index_ready;
+    int *filter_index_pool;
+    int *filter_indices[FILTER_COUNT];
+    int filter_counts[FILTER_COUNT];
+    int filter_index_ready;
     unsigned long long *ref_index_keys;
     int *ref_index_values;
     int ref_index_capacity;
@@ -425,6 +458,18 @@ typedef struct {
     int column_width_path;
     int column_width_size;
     int column_width_modified;
+    int show_folders;
+    int show_filters;
+    int theme_mode;
+    int sidebar_width;
+    int sidebar_split_percent;
+    int folder_panel_width;
+    int filter_panel_width;
+    int folder_panel_side;
+    int filter_panel_side;
+    int selected_filter;
+    int include_subfolders;
+    wchar_t folder_scope[SEARCH_FOLDER_SCOPE_MAX];
 } APP_STATE;
 
 extern APP_STATE g_app;

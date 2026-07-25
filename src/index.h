@@ -5,6 +5,7 @@
 
 void index_init(APP_STATE *app);
 void index_prepare_entry(INDEX_ENTRY *entry);
+int index_compact_entry_names(APP_STATE *app);
 void index_clear(APP_STATE *app);
 int index_add_entry(APP_STATE *app, INDEX_ENTRY *entry);
 int index_add_entries(APP_STATE *app, INDEX_ENTRY *entries, int count);
@@ -12,6 +13,8 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count);
 void index_build_paths(APP_STATE *app);
 int index_build_name_char_index(APP_STATE *app);
 void index_clear_name_char_index(APP_STATE *app);
+int index_build_filter_index(APP_STATE *app);
+void index_clear_filter_index(APP_STATE *app);
 int index_build_ref_index(APP_STATE *app);
 void index_clear_ref_index(APP_STATE *app);
 void index_sort_entries_by_name(APP_STATE *app);
@@ -22,5 +25,8 @@ int index_sort_by_date_modified(const void *a, const void *b);
 int index_sort_by_date_created(const void *a, const void *b);
 int index_sort_by_attributes(const void *a, const void *b);
 void index_free_entry(INDEX_ENTRY *entry);
+const wchar_t *index_entry_extension(const INDEX_ENTRY *entry);
+/* The caller must hold app->index_lock while using this helper. */
+wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index);
 
 #endif /* INDEX_H */

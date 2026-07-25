@@ -6,6 +6,7 @@
 #include "index.h"
 #include "cache.h"
 #include "resource.h"
+#include <dwmapi.h>
 
 /* Window procedure */
 static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -13,15 +14,33 @@ static LRESULT CALLBACK search_edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                                           UINT_PTR subclass_id, DWORD_PTR ref_data);
 static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                        UINT_PTR subclass_id, DWORD_PTR ref_data);
+static LRESULT CALLBACK panel_header_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR subclass_id, DWORD_PTR ref_data);
+static LRESULT CALLBACK status_bar_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR subclass_id, DWORD_PTR ref_data);
+static LRESULT CALLBACK subfolders_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR subclass_id, DWORD_PTR ref_data);
 
 static HINSTANCE g_hInst;
 static HWND g_hwndSearch;
 static HWND g_hwndList;
 static HWND g_hwndStatus;
+static HWND g_hwndFolderHeader;
+static HWND g_hwndFolderTree;
+static HWND g_hwndSubfolders;
+static HWND g_hwndFilterHeader;
+static HWND g_hwndFilterList;
+static HMENU g_menu_view;
+static HMENU g_menu_theme;
 static APP_STATE *g_app_ptr;
 static HFONT g_font_ui;
 static HFONT g_font_search;
 static HBRUSH g_brush_window;
+static HBRUSH g_brush_panel;
+static COLORREF g_color_window;
+static COLORREF g_color_panel;
+static COLORREF g_color_text;
+static int g_theme_is_dark;
 static int g_icon_file = I_IMAGENONE;
 static int g_icon_folder = I_IMAGENONE;
 static HANDLE g_cache_thread;
@@ -38,6 +57,38 @@ static HANDLE g_metadata_thread;
 static HANDLE g_metadata_event;
 static CRITICAL_SECTION g_metadata_queue_lock;
 static int g_metadata_queue_count;
+static int g_tree_folder_icon = I_IMAGENONE;
+static int g_tree_drive_icon = I_IMAGENONE;
+static int g_splitter_drag;
+static int g_panel_drag;
+static POINT g_panel_drag_start;
+static wchar_t g_status_text[256];
+
+typedef struct {
+    wchar_t path[SEARCH_FOLDER_SCOPE_MAX];
+    int loaded;
+    int loading;
+    int is_root;
+} FOLDER_NODE;
+
+typedef struct {
+    HWND owner;
+    HTREEITEM item;
+    FOLDER_NODE *node;
+    wchar_t path[SEARCH_FOLDER_SCOPE_MAX];
+} FOLDER_ENUM_JOB;
+
+typedef struct {
+    HTREEITEM item;
+    FOLDER_NODE *node;
+    wchar_t **names;
+    int count;
+} FOLDER_ENUM_RESULT;
+
+static const wchar_t *g_filter_names[FILTER_COUNT] = {
+    L"Everything", L"Audio", L"Compressed", L"Document",
+    L"Executable", L"Folder", L"Image", L"Video"
+};
 
 typedef struct {
     wchar_t *extension;
@@ -50,6 +101,7 @@ static int g_icon_cache_capacity;
 
 #define UI_SEARCH_TOP 4
 #define UI_SEARCH_HEIGHT 36
+#define UI_SPLITTER_SIZE 6
 #define IDT_SEARCH_DEBOUNCE 1
 #define IDT_STARTUP_SYNC 2
 #define SEARCH_DEBOUNCE_MS 120
@@ -63,6 +115,25 @@ static int g_icon_cache_capacity;
 #define IDM_CTX_SET_RUN_COUNT 20004
 #define IDM_CTX_SHELL_FIRST 21000
 #define IDM_CTX_SHELL_LAST 24000
+#define WM_UAHDRAWMENU 0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+
+typedef struct {
+    HMENU menu;
+    HDC dc;
+    DWORD flags;
+} UAH_MENU;
+
+typedef struct {
+    int position;
+} UAH_MENU_ITEM;
+
+typedef struct {
+    DRAWITEMSTRUCT draw;
+    UAH_MENU menu;
+    UAH_MENU_ITEM item;
+} UAH_DRAW_MENU_ITEM;
+
 struct SearchJob {
     APP_STATE *app;
     HWND hwnd;
@@ -127,10 +198,20 @@ static int ui_start_metadata_worker(APP_STATE *app, HWND hwnd);
 static DWORD WINAPI ui_metadata_thread_proc(void *p);
 static void ui_format_filetime(long long ft64, wchar_t *buf, size_t buf_size);
 static void ui_queue_search(HWND hwnd);
+static void ui_queue_filter_search(HWND hwnd);
 static void ui_apply_layout(HWND hwnd);
+static int ui_splitter_hit_test(HWND hwnd, POINT point);
+static void ui_dock_panel(int panel, int side);
+static void ui_apply_theme(HWND hwnd);
+static void ui_update_view_menu(void);
+static void ui_populate_folder_roots(void);
+static void ui_start_folder_enum(HTREEITEM item, FOLDER_NODE *node);
+static void ui_handle_folder_enum_result(FOLDER_ENUM_RESULT *result);
+static void ui_free_folder_result(FOLDER_ENUM_RESULT *result);
 static void ui_hide_horizontal_scrollbar(HWND hwndList);
 static void ui_update_sort_indicator(HWND hwndList, int column, int ascending);
 static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_same);
+static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw);
 static void ui_start_search(HWND hwnd);
 static void ui_start_cache_load(HWND hwnd);
 static int ui_search_can_refine(const SEARCH_QUERY *old_query, const SEARCH_QUERY *new_query);
@@ -140,7 +221,8 @@ static void usn_start_startup_sync(HWND hwnd);
 static DWORD WINAPI usn_startup_sync_thread_proc(void *p);
 static int usn_sync_once(APP_STATE *app, int *needs_rebuild, int *changed_count);
 static INDEX_ENTRY *ui_entry_from_row(APP_STATE *app, int row);
-static void ui_get_parent_path(const INDEX_ENTRY *entry, wchar_t *buf, size_t buf_size);
+static void ui_get_parent_path(APP_STATE *app, int entry_index,
+                               wchar_t *buf, size_t buf_size);
 
 /* Reindex context */
 struct ReindexCtx {
@@ -150,6 +232,9 @@ struct ReindexCtx {
 
 static void ui_init_visual_resources(void)
 {
+    g_color_window = RGB(255, 255, 255);
+    g_color_panel = RGB(245, 245, 245);
+    g_color_text = RGB(32, 37, 45);
     if (!g_font_ui) {
         g_font_ui = CreateFontW(
             -20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -165,7 +250,9 @@ static void ui_init_visual_resources(void)
     }
     
     if (!g_brush_window)
-        g_brush_window = CreateSolidBrush(RGB(255, 255, 255));
+        g_brush_window = CreateSolidBrush(g_color_window);
+    if (!g_brush_panel)
+        g_brush_panel = CreateSolidBrush(g_color_panel);
 }
 
 static void ui_free_visual_resources(void)
@@ -173,6 +260,7 @@ static void ui_free_visual_resources(void)
     if (g_font_ui) { DeleteObject(g_font_ui); g_font_ui = NULL; }
     if (g_font_search) { DeleteObject(g_font_search); g_font_search = NULL; }
     if (g_brush_window) { DeleteObject(g_brush_window); g_brush_window = NULL; }
+    if (g_brush_panel) { DeleteObject(g_brush_panel); g_brush_panel = NULL; }
     ui_clear_icon_cache();
 }
 
@@ -297,14 +385,18 @@ static INDEX_ENTRY *ui_entry_from_row(APP_STATE *app, int row)
     return &app->entries[idx];
 }
 
-static void ui_get_parent_path(const INDEX_ENTRY *entry, wchar_t *buf, size_t buf_size)
+static void ui_get_parent_path(APP_STATE *app, int entry_index,
+                               wchar_t *buf, size_t buf_size)
 {
-    if (!entry || !entry->path || !entry->path[0]) {
+    wchar_t *path = index_duplicate_entry_path_locked(app, entry_index);
+    if (!path || !path[0]) {
         wcscpy_s(buf, buf_size, L"");
+        free(path);
         return;
     }
     
-    wcscpy_s(buf, buf_size, entry->path);
+    wcsncpy_s(buf, buf_size, path, _TRUNCATE);
+    free(path);
     wchar_t *last = wcsrchr(buf, L'\\');
     if (last)
         *last = L'\0';
@@ -356,17 +448,17 @@ static DWORD WINAPI ui_metadata_thread_proc(void *p)
             EnterCriticalSection(&job->app->index_lock);
             if (job->entry_index >= 0 && job->entry_index < job->app->entry_count) {
                 INDEX_ENTRY *entry = &job->app->entries[job->entry_index];
+                wchar_t *current_path = index_duplicate_entry_path_locked(
+                    job->app, job->entry_index);
                 if (entry->file_ref == job->file_ref &&
                     entry->volume_index == job->volume_index &&
-                    entry->path && wcscmp(entry->path, job->path) == 0) {
+                    current_path && wcscmp(current_path, job->path) == 0) {
                     if (loaded) {
                         entry->attributes = data.dwFileAttributes;
                         entry->creation_time = ((long long)data.ftCreationTime.dwHighDateTime << 32) |
                                                data.ftCreationTime.dwLowDateTime;
                         entry->modification_time = ((long long)data.ftLastWriteTime.dwHighDateTime << 32) |
                                                    data.ftLastWriteTime.dwLowDateTime;
-                        entry->access_time = ((long long)data.ftLastAccessTime.dwHighDateTime << 32) |
-                                             data.ftLastAccessTime.dwLowDateTime;
                         size.LowPart = data.nFileSizeLow;
                         size.HighPart = data.nFileSizeHigh;
                         entry->size = job->is_directory ? 0 : (long long)size.QuadPart;
@@ -374,12 +466,12 @@ static DWORD WINAPI ui_metadata_thread_proc(void *p)
                         entry->size = 0;
                         entry->creation_time = 0;
                         entry->modification_time = 0;
-                        entry->access_time = 0;
                     }
                     entry->metadata_loaded = 1;
                     entry->metadata_queued = 0;
                     updated = 1;
                 }
+                free(current_path);
             }
             LeaveCriticalSection(&job->app->index_lock);
             
@@ -433,19 +525,18 @@ static void ui_queue_row_metadata(APP_STATE *app, int row)
     
     EnterCriticalSection(&app->index_lock);
     entry = ui_entry_from_row(app, row);
-    if (!entry || entry->metadata_loaded || entry->metadata_queued ||
-        !entry->path || !entry->path[0]) {
+    if (!entry || entry->metadata_loaded || entry->metadata_queued) {
         LeaveCriticalSection(&app->index_lock);
         return;
     }
-    path = _wcsdup(entry->path);
+    entry_index = (int)(entry - app->entries);
+    path = index_duplicate_entry_path_locked(app, entry_index);
     if (!path) {
         LeaveCriticalSection(&app->index_lock);
         return;
     }
     file_ref = entry->file_ref;
     volume_index = entry->volume_index;
-    entry_index = (int)(entry - app->entries);
     is_directory = entry->is_directory;
     entry->metadata_queued = 1;
     LeaveCriticalSection(&app->index_lock);
@@ -554,10 +645,11 @@ static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
     EnterCriticalSection(&app->index_lock);
     entry = ui_entry_from_row(app, row);
     if (entry) {
+        int entry_index = (int)(entry - app->entries);
         if (out_name)
             *out_name = _wcsdup(entry->name ? entry->name : L"");
         if (out_path)
-            *out_path = _wcsdup(entry->path ? entry->path : L"");
+            *out_path = index_duplicate_entry_path_locked(app, entry_index);
         if (out_is_dir)
             *out_is_dir = entry->is_directory;
     }
@@ -792,6 +884,9 @@ static int ui_search_can_refine(const SEARCH_QUERY *old_query, const SEARCH_QUER
         old_query->match_whole_word != new_query->match_whole_word ||
         old_query->match_path != new_query->match_path ||
         old_query->use_regex != new_query->use_regex ||
+        old_query->filter_id != new_query->filter_id ||
+        old_query->include_subfolders != new_query->include_subfolders ||
+        _wcsicmp(old_query->folder_scope, new_query->folder_scope) != 0 ||
         old_query->sort_column != new_query->sort_column ||
         old_query->sort_ascending != new_query->sort_ascending)
         return 0;
@@ -814,12 +909,21 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     int loaded;
     
     loaded = cache_load_index(ctx->app);
+    if (loaded && !ctx->app->shutting_down) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        index_build_filter_index(ctx->app);
+        index_build_ref_index(ctx->app);
+    }
     InterlockedExchange(&g_cache_loading, 0);
     if (!ctx->app->shutting_down)
-        PostMessageW(ctx->hwnd, loaded ? WM_CACHE_LOADED : WM_REFRESH, 0, 0);
+        PostMessageW(ctx->hwnd, loaded ? WM_CACHE_LOADED : WM_REFRESH,
+                     (WPARAM)loaded, 0);
+    if (loaded == CACHE_LOAD_LEGACY && !ctx->app->shutting_down) {
+        cache_save_index(ctx->app);
+        if (!ctx->app->shutting_down)
+            PostMessageW(ctx->hwnd, WM_CACHE_UPGRADE_DONE, 0, 0);
+    }
     if (loaded && !ctx->app->shutting_down) {
-        index_build_ref_index(ctx->app);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         index_build_name_char_index(ctx->app);
     }
     free(ctx);
@@ -878,6 +982,9 @@ static void ui_start_search(HWND hwnd)
     next_query.match_whole_word = app->match_whole_word;
     next_query.match_path = app->match_path;
     next_query.use_regex = app->use_regex;
+    next_query.filter_id = app->selected_filter;
+    next_query.include_subfolders = app->include_subfolders;
+    wcscpy_s(next_query.folder_scope, SEARCH_FOLDER_SCOPE_MAX, app->folder_scope);
     next_query.sort_column = app->query.sort_column;
     next_query.sort_ascending = app->query.sort_ascending;
     search_prepare_query(&next_query);
@@ -946,6 +1053,27 @@ static void ui_queue_search(HWND hwnd)
     InterlockedIncrement(&app->search_generation);
     KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
     SetTimer(hwnd, IDT_SEARCH_DEBOUNCE, SEARCH_DEBOUNCE_MS, NULL);
+}
+
+static void ui_queue_filter_search(HWND hwnd)
+{
+    APP_STATE *app = g_app_ptr;
+    if (!app)
+        return;
+
+    InterlockedIncrement(&app->search_generation);
+    KillTimer(hwnd, IDT_SEARCH_DEBOUNCE);
+
+    EnterCriticalSection(&app->index_lock);
+    app->filtered_count = 0;
+    app->filtered_identity = 0;
+    app->filtered_stale = 0;
+    LeaveCriticalSection(&app->index_lock);
+    ui_update_listview(g_hwndList, app);
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Searching...");
+
+    if (InterlockedCompareExchange(&g_search_running, 0, 0) == 0)
+        ui_start_search(hwnd);
 }
 
 static int usn_sync_once(APP_STATE *app, int *needs_rebuild, int *changed_count)
@@ -1022,7 +1150,16 @@ static int usn_sync_once(APP_STATE *app, int *needs_rebuild, int *changed_count)
             
             if (change_count > 0) {
                 InterlockedIncrement(&app->search_generation);
-                total_applied += index_apply_usn_changes(app, changes, change_count);
+                for (int offset = 0; offset < change_count && !app->shutting_down;
+                     offset += 512) {
+                    int batch = change_count - offset;
+                    if (batch > 512)
+                        batch = 512;
+                    total_applied += index_apply_usn_changes(
+                        app, changes + offset, batch);
+                    if (offset + batch < change_count)
+                        Sleep(1);
+                }
             }
             
             ntfs_free_usn_changes(changes, change_count);
@@ -1049,6 +1186,7 @@ static DWORD WINAPI usn_startup_sync_thread_proc(void *p)
     APP_STATE *app = ctx->app;
     HWND hwnd = ctx->hwnd;
     int idle_cycles = 0;
+    int filter_index_pending = 0;
     
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     
@@ -1061,10 +1199,13 @@ static DWORD WINAPI usn_startup_sync_thread_proc(void *p)
             break;
         if (changed_count > 0) {
             idle_cycles = 0;
+            filter_index_pending = !index_build_filter_index(app);
             PostMessageW(hwnd, WM_INDEX_SYNCED, (WPARAM)changed_count, 0);
         } else {
             int name_index_ready;
             idle_cycles++;
+            if (filter_index_pending && index_build_filter_index(app))
+                filter_index_pending = 0;
             EnterCriticalSection(&app->index_lock);
             name_index_ready = app->name_char_index_ready;
             LeaveCriticalSection(&app->index_lock);
@@ -1171,6 +1312,8 @@ static DWORD WINAPI reindex_thread_proc(void *p)
     a->index_error_count = failed_volumes;
     index_build_paths(a);
     index_sort_entries_by_name(a);
+    index_compact_entry_names(a);
+    index_build_filter_index(a);
     index_build_ref_index(a);
     index_build_name_char_index(a);
     if (a->entry_count > 0)
@@ -1273,13 +1416,324 @@ void ui_update_status(HWND hwndStatus, APP_STATE *app)
     SendMessageW(hwndStatus, SB_SETTEXTW, 0, (LPARAM)buf);
 }
 
+static FOLDER_NODE *ui_folder_node_new(const wchar_t *path, int is_root)
+{
+    FOLDER_NODE *node = (FOLDER_NODE *)calloc(1, sizeof(*node));
+    if (!node)
+        return NULL;
+    wcsncpy_s(node->path, SEARCH_FOLDER_SCOPE_MAX, path ? path : L"", _TRUNCATE);
+    node->is_root = is_root;
+    node->loaded = is_root;
+    return node;
+}
+
+static HTREEITEM ui_tree_insert(HTREEITEM parent, const wchar_t *text,
+                                FOLDER_NODE *node, int image, int has_children)
+{
+    TVINSERTSTRUCTW insert;
+    HTREEITEM item;
+    memset(&insert, 0, sizeof(insert));
+    insert.hParent = parent;
+    insert.hInsertAfter = TVI_SORT;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+    if (image != I_IMAGENONE)
+        insert.item.mask |= TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+    insert.item.pszText = (wchar_t *)text;
+    insert.item.lParam = (LPARAM)node;
+    insert.item.cChildren = has_children ? 1 : 0;
+    insert.item.iImage = image;
+    insert.item.iSelectedImage = image;
+    item = TreeView_InsertItem(g_hwndFolderTree, &insert);
+    if (!item)
+        free(node);
+    return item;
+}
+
+static void ui_populate_folder_roots(void)
+{
+    SHFILEINFOW sfi;
+    HIMAGELIST images;
+    wchar_t drives[512];
+    wchar_t *drive;
+    HTREEITEM root;
+
+    TreeView_DeleteAllItems(g_hwndFolderTree);
+    memset(&sfi, 0, sizeof(sfi));
+    images = (HIMAGELIST)SHGetFileInfoW(
+        L"folder", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    if (images) {
+        TreeView_SetImageList(g_hwndFolderTree, images, TVSIL_NORMAL);
+        g_tree_folder_icon = sfi.iIcon;
+    }
+    root = ui_tree_insert(TVI_ROOT, L"Everything",
+                          ui_folder_node_new(L"", 1), g_tree_folder_icon, 1);
+    drive = drives;
+    if (GetLogicalDriveStringsW(512, drives)) {
+        while (*drive) {
+            UINT type = GetDriveTypeW(drive);
+            if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE) {
+                memset(&sfi, 0, sizeof(sfi));
+                if (SHGetFileInfoW(drive, 0, &sfi, sizeof(sfi),
+                                   SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
+                    g_tree_drive_icon = sfi.iIcon;
+                ui_tree_insert(root, drive, ui_folder_node_new(drive, 0),
+                               g_tree_drive_icon, 1);
+            }
+            drive += wcslen(drive) + 1;
+        }
+    }
+    TreeView_Expand(g_hwndFolderTree, root, TVE_EXPAND);
+    TreeView_SelectItem(g_hwndFolderTree, root);
+}
+
+static int __cdecl ui_compare_folder_names(const void *lhs, const void *rhs)
+{
+    const wchar_t *a = *(const wchar_t *const *)lhs;
+    const wchar_t *b = *(const wchar_t *const *)rhs;
+    return _wcsicmp(a, b);
+}
+
+static void ui_free_folder_result(FOLDER_ENUM_RESULT *result)
+{
+    if (!result)
+        return;
+    for (int i = 0; i < result->count; i++)
+        free(result->names[i]);
+    free(result->names);
+    free(result);
+}
+
+static DWORD WINAPI ui_folder_enum_thread_proc(void *parameter)
+{
+    FOLDER_ENUM_JOB *job = (FOLDER_ENUM_JOB *)parameter;
+    FOLDER_ENUM_RESULT *result;
+    WIN32_FIND_DATAW data;
+    wchar_t pattern[SEARCH_FOLDER_SCOPE_MAX];
+    HANDLE find;
+    int capacity = 0;
+    size_t path_len;
+
+    result = (FOLDER_ENUM_RESULT *)calloc(1, sizeof(*result));
+    if (!result) {
+        free(job);
+        return 0;
+    }
+    result->item = job->item;
+    result->node = job->node;
+    path_len = wcslen(job->path);
+    swprintf_s(pattern, SEARCH_FOLDER_SCOPE_MAX, L"%ls%ls*",
+               job->path, path_len && job->path[path_len - 1] == L'\\' ? L"" : L"\\");
+    find = FindFirstFileW(pattern, &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t *name;
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+                continue;
+            if (result->count >= capacity) {
+                int next_capacity = capacity ? capacity * 2 : 32;
+                wchar_t **next = (wchar_t **)realloc(
+                    result->names, (size_t)next_capacity * sizeof(wchar_t *));
+                if (!next)
+                    break;
+                result->names = next;
+                capacity = next_capacity;
+            }
+            name = _wcsdup(data.cFileName);
+            if (name)
+                result->names[result->count++] = name;
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    if (result->count > 1)
+        qsort(result->names, result->count, sizeof(wchar_t *), ui_compare_folder_names);
+    if (!g_app_ptr || g_app_ptr->shutting_down ||
+        !PostMessageW(job->owner, WM_FOLDER_ENUM_READY, 0, (LPARAM)result))
+        ui_free_folder_result(result);
+    free(job);
+    return 0;
+}
+
+static void ui_start_folder_enum(HTREEITEM item, FOLDER_NODE *node)
+{
+    FOLDER_ENUM_JOB *job;
+    HANDLE thread;
+    if (!node || node->loaded || node->loading || !node->path[0])
+        return;
+    node->loading = 1;
+    job = (FOLDER_ENUM_JOB *)calloc(1, sizeof(*job));
+    if (!job) {
+        node->loading = 0;
+        return;
+    }
+    job->owner = g_app_ptr->hwnd_main;
+    job->item = item;
+    job->node = node;
+    wcscpy_s(job->path, SEARCH_FOLDER_SCOPE_MAX, node->path);
+    thread = CreateThread(NULL, 0, ui_folder_enum_thread_proc, job, 0, NULL);
+    if (thread)
+        CloseHandle(thread);
+    else {
+        node->loading = 0;
+        free(job);
+    }
+}
+
+static void ui_handle_folder_enum_result(FOLDER_ENUM_RESULT *result)
+{
+    TVITEMW item;
+    if (!result)
+        return;
+    memset(&item, 0, sizeof(item));
+    item.mask = TVIF_PARAM;
+    item.hItem = result->item;
+    if (!TreeView_GetItem(g_hwndFolderTree, &item) ||
+        (FOLDER_NODE *)item.lParam != result->node) {
+        ui_free_folder_result(result);
+        return;
+    }
+    result->node->loaded = 1;
+    result->node->loading = 0;
+    item.mask = TVIF_CHILDREN;
+    item.cChildren = result->count > 0 ? 1 : 0;
+    TreeView_SetItem(g_hwndFolderTree, &item);
+    for (int i = 0; i < result->count; i++) {
+        wchar_t path[SEARCH_FOLDER_SCOPE_MAX];
+        size_t path_len = wcslen(result->node->path);
+        swprintf_s(path, SEARCH_FOLDER_SCOPE_MAX, L"%ls%ls%ls",
+                   result->node->path,
+                   path_len && result->node->path[path_len - 1] == L'\\' ? L"" : L"\\",
+                   result->names[i]);
+        ui_tree_insert(result->item, result->names[i],
+                       ui_folder_node_new(path, 0), g_tree_folder_icon, 1);
+    }
+    ui_free_folder_result(result);
+}
+
+static int ui_system_theme_is_dark(void)
+{
+    DWORD light = 1;
+    DWORD size = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &light, &size);
+    return light == 0;
+}
+
+static void ui_update_view_menu(void)
+{
+    if (!g_menu_view || !g_app_ptr)
+        return;
+    CheckMenuItem(g_menu_view, IDM_VIEW_FOLDERS,
+                  MF_BYCOMMAND | (g_app_ptr->show_folders ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu_view, IDM_VIEW_FILTERS,
+                  MF_BYCOMMAND | (g_app_ptr->show_filters ? MF_CHECKED : MF_UNCHECKED));
+    if (g_menu_theme)
+        CheckMenuRadioItem(g_menu_theme, IDM_VIEW_THEME_LIGHT, IDM_VIEW_THEME_SYSTEM,
+                           g_app_ptr->theme_mode == THEME_LIGHT ? IDM_VIEW_THEME_LIGHT :
+                           g_app_ptr->theme_mode == THEME_DARK ? IDM_VIEW_THEME_DARK :
+                                                                  IDM_VIEW_THEME_SYSTEM,
+                           MF_BYCOMMAND);
+}
+
+static void ui_apply_theme(HWND hwnd)
+{
+    typedef int (WINAPI *SetPreferredAppModeFn)(int);
+    typedef void (WINAPI *FlushMenuThemesFn)(void);
+    typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
+    HMODULE uxtheme;
+    SetPreferredAppModeFn set_preferred_mode;
+    FlushMenuThemesFn flush_menu_themes;
+    AllowDarkModeForWindowFn allow_dark_window;
+    BOOL dark_title;
+    int dark;
+    HWND themed[] = {
+        g_hwndSearch, g_hwndList, ListView_GetHeader(g_hwndList), g_hwndStatus,
+        g_hwndFolderTree, g_hwndFilterList, g_hwndSubfolders,
+        g_hwndFolderHeader, g_hwndFilterHeader
+    };
+
+    if (!g_app_ptr)
+        return;
+    dark = g_app_ptr->theme_mode == THEME_DARK ||
+           (g_app_ptr->theme_mode == THEME_SYSTEM && ui_system_theme_is_dark());
+    g_theme_is_dark = dark;
+    g_color_window = dark ? RGB(0, 0, 0) : RGB(255, 255, 255);
+    g_color_panel = dark ? RGB(31, 31, 31) : RGB(245, 245, 245);
+    g_color_text = dark ? RGB(245, 245, 245) : RGB(32, 37, 45);
+    uxtheme = LoadLibraryW(L"uxtheme.dll");
+    if (uxtheme) {
+        set_preferred_mode = (SetPreferredAppModeFn)GetProcAddress(
+            uxtheme, (LPCSTR)(ULONG_PTR)135);
+        flush_menu_themes = (FlushMenuThemesFn)GetProcAddress(
+            uxtheme, (LPCSTR)(ULONG_PTR)136);
+        allow_dark_window = (AllowDarkModeForWindowFn)GetProcAddress(
+            uxtheme, (LPCSTR)(ULONG_PTR)133);
+        if (set_preferred_mode)
+            set_preferred_mode(dark ? 2 : 3);
+        if (allow_dark_window) {
+            allow_dark_window(hwnd, dark);
+            for (int i = 0; i < (int)(sizeof(themed) / sizeof(themed[0])); i++) {
+                if (themed[i])
+                    allow_dark_window(themed[i], dark);
+            }
+        }
+        if (flush_menu_themes)
+            flush_menu_themes();
+        FreeLibrary(uxtheme);
+    }
+    if (g_brush_window) DeleteObject(g_brush_window);
+    if (g_brush_panel) DeleteObject(g_brush_panel);
+    g_brush_window = CreateSolidBrush(g_color_window);
+    g_brush_panel = CreateSolidBrush(g_color_panel);
+    for (int i = 0; i < (int)(sizeof(themed) / sizeof(themed[0])); i++) {
+        if (themed[i])
+            SetWindowTheme(themed[i], dark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+    }
+    SetWindowTheme(g_hwndStatus, L"", NULL);
+    SetWindowTheme(g_hwndSubfolders, dark ? L"" : L"Explorer", NULL);
+    ListView_SetBkColor(g_hwndList, g_color_window);
+    ListView_SetTextBkColor(g_hwndList, g_color_window);
+    ListView_SetTextColor(g_hwndList, g_color_text);
+    if (g_hwndFolderTree) {
+        TreeView_SetBkColor(g_hwndFolderTree, g_color_window);
+        TreeView_SetTextColor(g_hwndFolderTree, g_color_text);
+    }
+    InvalidateRect(ListView_GetHeader(g_hwndList), NULL, TRUE);
+    InvalidateRect(g_hwndStatus, NULL, TRUE);
+    InvalidateRect(g_hwndSubfolders, NULL, TRUE);
+    dark_title = dark;
+    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dark_title, sizeof(dark_title))))
+        DwmSetWindowAttribute(hwnd, 19, &dark_title, sizeof(dark_title));
+    ui_update_view_menu();
+    DrawMenuBar(hwnd);
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(hwnd, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
 static void ui_apply_layout(HWND hwnd)
 {
     RECT rc;
     RECT rc_status;
-    HDWP positions;
     int status_h = 22;
     int list_top = UI_SEARCH_TOP + UI_SEARCH_HEIGHT;
+    int content_bottom;
+    int gap = UI_SPLITTER_SIZE;
+    int header_h = 30;
+    int check_h = 30;
+    int left_panel = 0;
+    int right_panel = 0;
+    int left_width = 0;
+    int right_width = 0;
+    int visible_count = 0;
+    int max_panel_total;
+    int list_left;
+    int list_right;
+    APP_STATE *app = g_app_ptr;
     
     if (!g_hwndSearch || !g_hwndList || !g_hwndStatus)
         return;
@@ -1290,22 +1744,122 @@ static void ui_apply_layout(HWND hwnd)
     if (status_h <= 0)
         status_h = 22;
     
-    positions = BeginDeferWindowPos(2);
-    if (!positions)
-        return;
-    positions = DeferWindowPos(positions, g_hwndSearch, NULL,
-                               4, UI_SEARCH_TOP,
-                               rc.right - 8, UI_SEARCH_HEIGHT - 8,
-                               SWP_NOZORDER | SWP_NOACTIVATE);
-    if (positions) {
-        positions = DeferWindowPos(positions, g_hwndList, NULL,
-                                   0, list_top,
-                                   rc.right, rc.bottom - list_top - status_h,
-                                   SWP_NOZORDER | SWP_NOACTIVATE);
+    content_bottom = rc.bottom - status_h;
+    if (app && app->show_folders && app->show_filters &&
+        app->folder_panel_side == app->filter_panel_side) {
+        app->filter_panel_side = app->folder_panel_side == PANEL_DOCK_LEFT
+            ? PANEL_DOCK_RIGHT : PANEL_DOCK_LEFT;
     }
-    if (positions)
-        EndDeferWindowPos(positions);
+    if (app && app->show_folders) {
+        visible_count++;
+        if (app->folder_panel_side == PANEL_DOCK_LEFT) {
+            left_panel = 1;
+            left_width = app->folder_panel_width;
+        } else {
+            right_panel = 1;
+            right_width = app->folder_panel_width;
+        }
+    }
+    if (app && app->show_filters) {
+        visible_count++;
+        if (app->filter_panel_side == PANEL_DOCK_LEFT) {
+            left_panel = 2;
+            left_width = app->filter_panel_width;
+        } else {
+            right_panel = 2;
+            right_width = app->filter_panel_width;
+        }
+    }
+
+    max_panel_total = rc.right - 280 - visible_count * gap;
+    if (max_panel_total < visible_count * 160)
+        max_panel_total = visible_count * 160;
+    if (left_panel && right_panel && left_width + right_width > max_panel_total) {
+        int available = max_panel_total / 2;
+        left_width = available;
+        right_width = max_panel_total - available;
+    } else if (left_panel && left_width > max_panel_total) {
+        left_width = max_panel_total;
+    } else if (right_panel && right_width > max_panel_total) {
+        right_width = max_panel_total;
+    }
+    if (left_panel && left_width < 160) left_width = 160;
+    if (right_panel && right_width < 160) right_width = 160;
+
+    MoveWindow(g_hwndSearch, 4, UI_SEARCH_TOP,
+               rc.right - 8, UI_SEARCH_HEIGHT - 8, TRUE);
+    list_left = left_panel ? left_width + gap : 0;
+    list_right = right_panel ? rc.right - right_width - gap : rc.right;
+    if (list_right < list_left)
+        list_right = list_left;
+    MoveWindow(g_hwndList, list_left, list_top,
+               list_right - list_left, content_bottom - list_top, TRUE);
+
+    ShowWindow(g_hwndFolderHeader, app && app->show_folders ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(g_hwndFolderTree, app && app->show_folders ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(g_hwndSubfolders, app && app->show_folders ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(g_hwndFilterHeader, app && app->show_filters ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(g_hwndFilterList, app && app->show_filters ? SW_SHOWNA : SW_HIDE);
+
+    if (app && app->show_folders) {
+        int width = app->folder_panel_side == PANEL_DOCK_LEFT
+            ? left_width : right_width;
+        int x = app->folder_panel_side == PANEL_DOCK_LEFT ? 0 : rc.right - width;
+        int tree_height = content_bottom - list_top - header_h - check_h;
+        if (tree_height < 0) tree_height = 0;
+        MoveWindow(g_hwndFolderHeader, x, list_top, width, header_h, TRUE);
+        MoveWindow(g_hwndFolderTree, x, list_top + header_h,
+                   width, tree_height, TRUE);
+        MoveWindow(g_hwndSubfolders, x, content_bottom - check_h,
+                   width, check_h, TRUE);
+    }
+    if (app && app->show_filters) {
+        int width = app->filter_panel_side == PANEL_DOCK_LEFT
+            ? left_width : right_width;
+        int x = app->filter_panel_side == PANEL_DOCK_LEFT ? 0 : rc.right - width;
+        MoveWindow(g_hwndFilterHeader, x, list_top, width, header_h, TRUE);
+        MoveWindow(g_hwndFilterList, x, list_top + header_h,
+                   width, content_bottom - list_top - header_h, TRUE);
+    }
     ui_hide_horizontal_scrollbar(g_hwndList);
+}
+
+static int ui_splitter_hit_test(HWND hwnd, POINT point)
+{
+    RECT list_rect;
+    APP_STATE *app = g_app_ptr;
+
+    if (!app || (!app->show_folders && !app->show_filters))
+        return 0;
+
+    GetWindowRect(g_hwndList, &list_rect);
+    MapWindowPoints(NULL, hwnd, (POINT *)&list_rect, 2);
+    if (point.y >= list_rect.top && point.y < list_rect.bottom &&
+        point.x >= list_rect.left - UI_SPLITTER_SIZE && point.x < list_rect.left)
+        return 1;
+    if (point.y >= list_rect.top && point.y < list_rect.bottom &&
+        point.x >= list_rect.right && point.x < list_rect.right + UI_SPLITTER_SIZE)
+        return 2;
+    return 0;
+}
+
+static void ui_dock_panel(int panel, int side)
+{
+    APP_STATE *app = g_app_ptr;
+    int *moving;
+    int *other;
+
+    if (!app || (panel != 1 && panel != 2) ||
+        (side != PANEL_DOCK_LEFT && side != PANEL_DOCK_RIGHT))
+        return;
+    moving = panel == 1 ? &app->folder_panel_side : &app->filter_panel_side;
+    other = panel == 1 ? &app->filter_panel_side : &app->folder_panel_side;
+    if (*moving == side)
+        return;
+    if (app->show_folders && app->show_filters && *other == side)
+        *other = side == PANEL_DOCK_LEFT ? PANEL_DOCK_RIGHT : PANEL_DOCK_LEFT;
+    *moving = side;
+    ui_apply_layout(app->hwnd_main);
 }
 
 static void ui_hide_horizontal_scrollbar(HWND hwndList)
@@ -1356,6 +1910,81 @@ static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_sam
     ui_queue_search(hwnd);
 }
 
+static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw)
+{
+    if (!g_theme_is_dark)
+        return CDRF_DODEFAULT;
+    if (draw->dwDrawStage == CDDS_PREPAINT)
+        return CDRF_NOTIFYITEMDRAW;
+    if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
+        wchar_t text[128] = L"";
+        HDITEMW item;
+        RECT rc = draw->rc;
+        RECT text_rc = rc;
+        HBRUSH background;
+        HPEN separator;
+        HGDIOBJ old_pen;
+        HGDIOBJ old_font;
+        UINT format = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+
+        memset(&item, 0, sizeof(item));
+        item.mask = HDI_TEXT | HDI_FORMAT;
+        item.pszText = text;
+        item.cchTextMax = (int)(sizeof(text) / sizeof(text[0]));
+        Header_GetItem(draw->hdr.hwndFrom, (int)draw->dwItemSpec, &item);
+
+        background = CreateSolidBrush((draw->uItemState & CDIS_HOT)
+                                      ? RGB(48, 48, 48) : g_color_panel);
+        FillRect(draw->hdc, &rc, background);
+        DeleteObject(background);
+
+        text_rc.left += 8;
+        text_rc.right -= (item.fmt & (HDF_SORTUP | HDF_SORTDOWN)) ? 24 : 8;
+        if (item.fmt & HDF_RIGHT)
+            format |= DT_RIGHT;
+        else if (item.fmt & HDF_CENTER)
+            format |= DT_CENTER;
+        else
+            format |= DT_LEFT;
+        SetBkMode(draw->hdc, TRANSPARENT);
+        SetTextColor(draw->hdc, g_color_text);
+        old_font = SelectObject(draw->hdc,
+                                g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(draw->hdc, text, -1, &text_rc, format);
+        SelectObject(draw->hdc, old_font);
+
+        if (item.fmt & (HDF_SORTUP | HDF_SORTDOWN)) {
+            POINT triangle[3];
+            int x = rc.right - 12;
+            int y = (rc.top + rc.bottom) / 2;
+            HBRUSH arrow = CreateSolidBrush(g_color_text);
+            HRGN region;
+            if (item.fmt & HDF_SORTUP) {
+                triangle[0].x = x; triangle[0].y = y - 3;
+                triangle[1].x = x - 4; triangle[1].y = y + 2;
+                triangle[2].x = x + 4; triangle[2].y = y + 2;
+            } else {
+                triangle[0].x = x; triangle[0].y = y + 3;
+                triangle[1].x = x - 4; triangle[1].y = y - 2;
+                triangle[2].x = x + 4; triangle[2].y = y - 2;
+            }
+            region = CreatePolygonRgn(triangle, 3, WINDING);
+            FillRgn(draw->hdc, region, arrow);
+            DeleteObject(region);
+            DeleteObject(arrow);
+        }
+
+        separator = CreatePen(PS_SOLID, 1, RGB(68, 68, 68));
+        old_pen = SelectObject(draw->hdc, separator);
+        MoveToEx(draw->hdc, rc.right - 1, rc.top, NULL);
+        LineTo(draw->hdc, rc.right - 1, rc.bottom);
+        SelectObject(draw->hdc, old_pen);
+        DeleteObject(separator);
+        return CDRF_SKIPDEFAULT;
+    }
+    return CDRF_DODEFAULT;
+}
+
 /* =============================================================
  * Main window procedure
  * ============================================================= */
@@ -1364,7 +1993,57 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     APP_STATE *app = g_app_ptr;
     
     switch (msg) {
+    case WM_UAHDRAWMENU:
+        if (g_theme_is_dark && lParam) {
+            UAH_MENU *menu = (UAH_MENU *)lParam;
+            MENUBARINFO info;
+            RECT window_rect;
+            RECT bar_rect;
+            memset(&info, 0, sizeof(info));
+            info.cbSize = sizeof(info);
+            if (GetMenuBarInfo(hwnd, OBJID_MENU, 0, &info) &&
+                GetWindowRect(hwnd, &window_rect)) {
+                bar_rect = info.rcBar;
+                OffsetRect(&bar_rect, -window_rect.left, -window_rect.top);
+                FillRect(menu->dc, &bar_rect, g_brush_panel);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_UAHDRAWMENUITEM:
+        if (g_theme_is_dark && lParam) {
+            UAH_DRAW_MENU_ITEM *draw = (UAH_DRAW_MENU_ITEM *)lParam;
+            MENUITEMINFOW item;
+            wchar_t text[128] = L"";
+            RECT text_rect = draw->draw.rcItem;
+            HBRUSH background;
+            HGDIOBJ old_font;
+            memset(&item, 0, sizeof(item));
+            item.cbSize = sizeof(item);
+            item.fMask = MIIM_STRING;
+            item.dwTypeData = text;
+            item.cch = (UINT)(sizeof(text) / sizeof(text[0]));
+            GetMenuItemInfoW(draw->menu.menu, draw->item.position, TRUE, &item);
+            background = CreateSolidBrush(
+                draw->draw.itemState & (ODS_HOTLIGHT | ODS_SELECTED)
+                ? RGB(55, 55, 55) : g_color_panel);
+            FillRect(draw->draw.hDC, &draw->draw.rcItem, background);
+            DeleteObject(background);
+            SetBkMode(draw->draw.hDC, TRANSPARENT);
+            SetTextColor(draw->draw.hDC, g_color_text);
+            old_font = SelectObject(draw->draw.hDC,
+                                    g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+            DrawTextW(draw->draw.hDC, text, -1, &text_rect,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(draw->draw.hDC, old_font);
+            return 0;
+        }
+        break;
+
     case WM_INITMENUPOPUP:
+        ui_update_view_menu();
+        /* fall through */
     case WM_DRAWITEM:
     case WM_MEASUREITEM:
     case WM_MENUCHAR:
@@ -1395,6 +2074,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         HMENU hSearch = CreatePopupMenu();
         HMENU hIndex = CreatePopupMenu();
         HMENU hHelp = CreatePopupMenu();
+        HMENU hTheme = CreatePopupMenu();
         
         AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT, L"Exit\tAlt+F4");
         AppendMenuW(hEdit, MF_STRING, IDM_EDIT_COPY, L"Copy\tCtrl+C");
@@ -1402,7 +2082,21 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         AppendMenuW(hEdit, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hEdit, MF_STRING, IDM_EDIT_SELECT_ALL, L"Select All\tCtrl+A");
         
-        /* View menu with check marks */
+        /* View panels and theme */
+        g_menu_view = hView;
+        g_menu_theme = hTheme;
+        AppendMenuW(hView, MF_STRING | (app->show_folders ? MF_CHECKED : 0),
+                    IDM_VIEW_FOLDERS, L"Folders");
+        AppendMenuW(hView, MF_STRING | (app->show_filters ? MF_CHECKED : 0),
+                    IDM_VIEW_FILTERS, L"Filters");
+        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_LIGHT, L"Light");
+        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_DARK, L"Dark");
+        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_SYSTEM, L"System");
+        AppendMenuW(hView, MF_POPUP, (UINT_PTR)hTheme, L"Themes");
+        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
+
+        /* Existing search options */
         UINT flags = app ? (app->match_case ? MF_CHECKED : 0) : 0;
         AppendMenuW(hView, MF_STRING | flags, IDM_VIEW_MATCH_CASE, L"Match Case");
         flags = app ? (app->match_whole_word ? MF_CHECKED : 0) : 0;
@@ -1500,6 +2194,48 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         app->hwnd_search = g_hwndSearch;
         app->hwnd_list = g_hwndList;
         app->hwnd_status = g_hwndStatus;
+
+        g_hwndFolderHeader = CreateWindowExW(
+            0, L"STATIC", L"Folders",
+            WS_CHILD | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
+            0, 0, 0, 0, hwnd, NULL, cs->hInstance, NULL);
+        g_hwndFolderTree = CreateWindowExW(
+            WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+            WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES |
+            TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_DISABLEDRAGDROP,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_FOLDER_TREE, cs->hInstance, NULL);
+        g_hwndSubfolders = CreateWindowExW(
+            0, L"BUTTON", L"Subfolders",
+            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SUBFOLDERS, cs->hInstance, NULL);
+        g_hwndFilterHeader = CreateWindowExW(
+            0, L"STATIC", L"Filters",
+            WS_CHILD | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
+            0, 0, 0, 0, hwnd, NULL, cs->hInstance, NULL);
+        g_hwndFilterList = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_FILTER_LIST, cs->hInstance, NULL);
+
+        SetWindowSubclass(g_hwndFolderHeader, panel_header_proc, 1, 1);
+        SetWindowSubclass(g_hwndFilterHeader, panel_header_proc, 1, 2);
+        SetWindowSubclass(g_hwndStatus, status_bar_proc, 1, 0);
+        SetWindowSubclass(g_hwndSubfolders, subfolders_proc, 1, 0);
+
+        SendMessageW(g_hwndFolderHeader, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(g_hwndFolderTree, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(g_hwndSubfolders, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(g_hwndFilterHeader, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(g_hwndFilterList, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(g_hwndSubfolders, BM_SETCHECK,
+                     app->include_subfolders ? BST_CHECKED : BST_UNCHECKED, 0);
+        for (int i = 0; i < FILTER_COUNT; i++)
+            SendMessageW(g_hwndFilterList, LB_ADDSTRING, 0, (LPARAM)g_filter_names[i]);
+        SendMessageW(g_hwndFilterList, LB_SETCURSEL, app->selected_filter, 0);
+        ui_populate_folder_roots();
+        ui_update_view_menu();
+        ui_apply_theme(hwnd);
+        ui_apply_layout(hwnd);
         ui_start_metadata_worker(app, hwnd);
         
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Loading index cache...");
@@ -1509,12 +2245,26 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     }
     
     /* ---- Window sizing ---- */
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *info = (MINMAXINFO *)lParam;
+        info->ptMinTrackSize.x = 640;
+        info->ptMinTrackSize.y = 450;
+        return 0;
+    }
+
     case WM_ENTERSIZEMOVE:
         g_in_size_move = 1;
         return 0;
     
     case WM_SIZE:
         ui_apply_layout(hwnd);
+        return 0;
+
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+        if (app && app->theme_mode == THEME_SYSTEM)
+            ui_apply_theme(hwnd);
         return 0;
     
     case WM_EXITSIZEMOVE:
@@ -1523,6 +2273,78 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         RedrawWindow(hwnd, NULL, NULL,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            POINT point;
+            GetCursorPos(&point);
+            ScreenToClient(hwnd, &point);
+            int splitter = ui_splitter_hit_test(hwnd, point);
+            if (splitter) {
+                SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+    {
+        POINT point = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        g_splitter_drag = ui_splitter_hit_test(hwnd, point);
+        if (g_splitter_drag) {
+            SetCapture(hwnd);
+            SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+            return 0;
+        }
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+        if (g_splitter_drag && GetCapture() == hwnd) {
+            POINT point = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+            RECT rc;
+            int width;
+            int maximum = 600;
+            int other_width = 0;
+            int visible_count = (app->show_folders ? 1 : 0) +
+                                (app->show_filters ? 1 : 0);
+            int side = g_splitter_drag == 1 ? PANEL_DOCK_LEFT : PANEL_DOCK_RIGHT;
+            GetClientRect(hwnd, &rc);
+            width = side == PANEL_DOCK_LEFT ? point.x : rc.right - point.x;
+            if (visible_count == 2) {
+                if (app->folder_panel_side != side)
+                    other_width = app->folder_panel_width;
+                else
+                    other_width = app->filter_panel_width;
+                maximum = rc.right - 280 - visible_count * UI_SPLITTER_SIZE - other_width;
+                if (maximum > 600) maximum = 600;
+                if (maximum < 160) maximum = 160;
+            }
+            if (width < 160) width = 160;
+            if (width > maximum) width = maximum;
+            if (app->show_folders && app->folder_panel_side == side) {
+                app->folder_panel_width = width;
+            } else {
+                app->filter_panel_width = width;
+            }
+            ui_apply_layout(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (g_splitter_drag) {
+            g_splitter_drag = 0;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+            return 0;
+        }
+        break;
+
+    case WM_CAPTURECHANGED:
+        if ((HWND)lParam != hwnd)
+            g_splitter_drag = 0;
+        break;
     
     /* ---- Menu and command handling ---- */
     case WM_COMMAND:
@@ -1534,10 +2356,24 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             ui_queue_search(hwnd);
             return 0;
         }
+        if (id == IDC_FILTER_LIST && notify == LBN_SELCHANGE) {
+            int selected = (int)SendMessageW(g_hwndFilterList, LB_GETCURSEL, 0, 0);
+            if (selected >= FILTER_EVERYTHING && selected < FILTER_COUNT) {
+                app->selected_filter = selected;
+                ui_queue_filter_search(hwnd);
+            }
+            return 0;
+        }
+        if (id == IDC_SUBFOLDERS && notify == BN_CLICKED) {
+            app->include_subfolders =
+                SendMessageW(g_hwndSubfolders, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            ui_queue_search(hwnd);
+            return 0;
+        }
         
         switch (id) {
         case IDM_FILE_EXIT:
-            DestroyWindow(hwnd);
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
             break;
             
         case IDM_EDIT_COPY:
@@ -1566,20 +2402,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         {
             int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
             if (sel >= 0 && sel < app->filtered_count) {
-                INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                if (!e) break;
-                if (OpenClipboard(hwnd)) {
-                    EmptyClipboard();
-                    size_t len = (wcslen(e->path) + 1) * sizeof(wchar_t);
-                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-                    if (hMem) {
-                        wchar_t *p = (wchar_t *)GlobalLock(hMem);
-                        wcscpy_s(p, len / sizeof(wchar_t), e->path);
-                        GlobalUnlock(hMem);
-                        SetClipboardData(CF_UNICODETEXT, hMem);
-                    }
-                    CloseClipboard();
-                }
+                wchar_t *path = NULL;
+                if (ui_copy_entry_snapshot(app, sel, NULL, &path, NULL))
+                    ui_copy_text_to_clipboard(hwnd, path);
+                free(path);
             }
             break;
         }
@@ -1588,6 +2414,33 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             for (int i = 0; i < app->filtered_count; i++) {
                 ListView_SetItemState(g_hwndList, i, LVIS_SELECTED, LVIS_SELECTED);
             }
+            break;
+
+        case IDM_VIEW_FOLDERS:
+            app->show_folders = !app->show_folders;
+            ui_update_view_menu();
+            ui_apply_layout(hwnd);
+            break;
+
+        case IDM_VIEW_FILTERS:
+            app->show_filters = !app->show_filters;
+            ui_update_view_menu();
+            ui_apply_layout(hwnd);
+            break;
+
+        case IDM_VIEW_THEME_LIGHT:
+            app->theme_mode = THEME_LIGHT;
+            ui_apply_theme(hwnd);
+            break;
+
+        case IDM_VIEW_THEME_DARK:
+            app->theme_mode = THEME_DARK;
+            ui_apply_theme(hwnd);
+            break;
+
+        case IDM_VIEW_THEME_SYSTEM:
+            app->theme_mode = THEME_SYSTEM;
+            ui_apply_theme(hwnd);
             break;
             
         case IDM_VIEW_MATCH_CASE:
@@ -1641,7 +2494,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             
         case IDM_HELP_ABOUT:
             MessageBoxW(hwnd,
-                L"OpenEverything v1.0\n\n"
+                L"OpenEverything v0.1.9\n\n"
                 L"Everything的开源复刻版本。\n\n"
                 L"原理介绍：\n"
                 L"通过 NTFS USN Journal / MFT 快速建立文件名索引，\n"
@@ -1672,6 +2525,33 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     case WM_NOTIFY:
     {
         NMHDR *nm = (NMHDR *)lParam;
+        if (nm->hwndFrom == ListView_GetHeader(g_hwndList) &&
+            nm->code == NM_CUSTOMDRAW)
+            return ui_custom_draw_list_header((NMCUSTOMDRAW *)lParam);
+        if (nm->idFrom == IDC_FOLDER_TREE) {
+            if (nm->code == TVN_ITEMEXPANDINGW) {
+                NMTREEVIEWW *tree = (NMTREEVIEWW *)lParam;
+                if (tree->action == TVE_EXPAND)
+                    ui_start_folder_enum(tree->itemNew.hItem,
+                                         (FOLDER_NODE *)tree->itemNew.lParam);
+                return 0;
+            }
+            if (nm->code == TVN_SELCHANGEDW) {
+                NMTREEVIEWW *tree = (NMTREEVIEWW *)lParam;
+                FOLDER_NODE *node = (FOLDER_NODE *)tree->itemNew.lParam;
+                if (node) {
+                    wcscpy_s(app->folder_scope, SEARCH_FOLDER_SCOPE_MAX, node->path);
+                    SetWindowTextW(g_hwndSearch, L"");
+                    ui_queue_search(hwnd);
+                }
+                return 0;
+            }
+            if (nm->code == TVN_DELETEITEMW) {
+                NMTREEVIEWW *tree = (NMTREEVIEWW *)lParam;
+                free((FOLDER_NODE *)tree->itemOld.lParam);
+                return 0;
+            }
+        }
         if (nm->idFrom == IDC_LISTVIEW) {
             switch (nm->code) {
             case LVN_COLUMNCLICK:
@@ -1703,9 +2583,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 e = ui_entry_from_row(app, di->item.iItem);
                 
                 if (e) {
+                    int entry_index = (int)(e - app->entries);
                     has_entry = 1;
                     icon_is_dir = e->is_directory;
-                    wcsncpy_s(icon_ext, 64, e->extension ? e->extension : L"", _TRUNCATE);
+                    wcsncpy_s(icon_ext, 64, index_entry_extension(e), _TRUNCATE);
                     
                     if (di->item.mask & LVIF_TEXT) {
                         switch (di->item.iSubItem) {
@@ -1714,7 +2595,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                             di->item.pszText = text_buf;
                             break;
                         case COL_PATH:
-                            ui_get_parent_path(e, text_buf, 512);
+                            ui_get_parent_path(app, entry_index, text_buf, 512);
                             di->item.pszText = text_buf;
                             break;
                         case COL_SIZE:
@@ -1771,22 +2652,28 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 if (kd->wVKey == VK_DELETE) {
                     int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
                     if (sel >= 0 && sel < app->filtered_count) {
-                        INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                        if (!e) break;
+                        wchar_t *name = NULL;
+                        wchar_t *path = NULL;
+                        int is_directory = 0;
                         wchar_t msg[1024];
-                        swprintf_s(msg, 1024, L"Delete \"%s\"?", e->name);
+                        if (!ui_copy_entry_snapshot(app, sel, &name, &path,
+                                                    &is_directory))
+                            break;
+                        swprintf_s(msg, 1024, L"Delete \"%s\"?", name);
                         if (MessageBoxW(hwnd, msg, L"Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            if (e->is_directory) {
+                            if (is_directory) {
                                 /* Recycle bin delete */
                                 SHFILEOPSTRUCTW op = {0};
                                 op.wFunc = FO_DELETE;
-                                op.pFrom = e->path;
+                                op.pFrom = path;
                                 op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
                                 SHFileOperationW(&op);
                             } else {
-                                DeleteFileW(e->path);
+                                DeleteFileW(path);
                             }
                         }
+                        free(path);
+                        free(name);
                     }
                 }
                 else if (kd->wVKey == VK_RETURN) {
@@ -1887,6 +2774,19 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         FillRect((HDC)wParam, &rc, g_brush_window ? g_brush_window : (HBRUSH)(COLOR_WINDOW + 1));
         return 1;
     }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    {
+        HWND control = (HWND)lParam;
+        int panel = control == g_hwndFolderHeader ||
+                    control == g_hwndSubfolders || control == g_hwndFilterHeader;
+        SetTextColor((HDC)wParam, g_color_text);
+        SetBkColor((HDC)wParam, panel ? g_color_panel : g_color_window);
+        return (LRESULT)(panel ? g_brush_panel : g_brush_window);
+    }
     
     /* ---- User-defined messages ---- */
     case WM_SEARCH_UPDATE:
@@ -1903,7 +2803,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         
         if (job && done_generation == app->search_generation) {
             EnterCriticalSection(&app->index_lock);
-            if (job->result_count <= app->entry_capacity && app->filtered_indices) {
+            if (job->result_count <= SEARCH_MAX_RESULTS && app->filtered_indices) {
                 memcpy(app->filtered_indices, job->results, job->result_count * sizeof(int));
                 app->filtered_count = job->result_count;
                 app->filtered_identity = 0;
@@ -1950,6 +2850,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             ListView_RedrawItems(g_hwndList, top, last);
         return 0;
     }
+
+    case WM_FOLDER_ENUM_READY:
+        ui_handle_folder_enum_result((FOLDER_ENUM_RESULT *)lParam);
+        return 0;
     
     case WM_INDEX_PROGRESS:
     {
@@ -1995,6 +2899,14 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     {
         ui_update_status(g_hwndStatus, app);
         ui_queue_search(hwnd);
+        KillTimer(hwnd, IDT_STARTUP_SYNC);
+        if ((int)wParam != CACHE_LOAD_LEGACY)
+            SetTimer(hwnd, IDT_STARTUP_SYNC, STARTUP_SYNC_DELAY_MS, NULL);
+        return 0;
+    }
+
+    case WM_CACHE_UPGRADE_DONE:
+    {
         KillTimer(hwnd, IDT_STARTUP_SYNC);
         SetTimer(hwnd, IDT_STARTUP_SYNC, STARTUP_SYNC_DELAY_MS, NULL);
         return 0;
@@ -2079,6 +2991,229 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static LRESULT CALLBACK panel_header_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                          UINT_PTR subclass_id, DWORD_PTR ref_data)
+{
+    int panel = (int)ref_data;
+    const int close_width = 32;
+
+    switch (msg) {
+    case WM_SETCURSOR:
+    {
+        POINT point;
+        RECT rc;
+        GetCursorPos(&point);
+        ScreenToClient(hwnd, &point);
+        GetClientRect(hwnd, &rc);
+        SetCursor(LoadCursorW(NULL,
+                              point.x >= rc.right - close_width
+                                  ? IDC_HAND : IDC_SIZEALL));
+        return TRUE;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint;
+        RECT rc;
+        RECT text_rc;
+        HDC dc = BeginPaint(hwnd, &paint);
+        HPEN cross_pen;
+        HGDIOBJ old_font;
+        int center_x;
+        int center_y;
+
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brush_panel ? g_brush_panel :
+                 (HBRUSH)(COLOR_BTNFACE + 1));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, g_color_text);
+        old_font = SelectObject(dc, g_font_ui ? g_font_ui :
+                                GetStockObject(DEFAULT_GUI_FONT));
+        text_rc = rc;
+        text_rc.left += 10;
+        text_rc.right -= close_width;
+        DrawTextW(dc, panel == 1 ? L"Folders" : L"Filters", -1, &text_rc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        center_x = rc.right - close_width / 2;
+        center_y = (rc.top + rc.bottom) / 2;
+        cross_pen = CreatePen(PS_SOLID, 2, g_color_text);
+        if (cross_pen) {
+            HGDIOBJ old_pen = SelectObject(dc, cross_pen);
+            MoveToEx(dc, center_x - 5, center_y - 5, NULL);
+            LineTo(dc, center_x + 5, center_y + 5);
+            MoveToEx(dc, center_x + 5, center_y - 5, NULL);
+            LineTo(dc, center_x - 5, center_y + 5);
+            SelectObject(dc, old_pen);
+            DeleteObject(cross_pen);
+        }
+        SelectObject(dc, old_font);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN:
+    {
+        POINT point = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (point.x >= rc.right - close_width) {
+            HWND parent = GetParent(hwnd);
+            if (parent)
+                SendMessageW(parent, WM_COMMAND,
+                             MAKEWPARAM(panel == 1 ? IDM_VIEW_FOLDERS
+                                                    : IDM_VIEW_FILTERS, 0), 0);
+            return 0;
+        }
+        g_panel_drag = panel;
+        GetCursorPos(&g_panel_drag_start);
+        SetCapture(hwnd);
+        SetCursor(LoadCursorW(NULL, IDC_SIZEALL));
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+        if (g_panel_drag == panel && GetCapture() == hwnd && (wParam & MK_LBUTTON)) {
+            POINT point;
+            RECT rc;
+            GetCursorPos(&point);
+            if (abs(point.x - g_panel_drag_start.x) >= 4 ||
+                abs(point.y - g_panel_drag_start.y) >= 4) {
+                ScreenToClient(g_app_ptr->hwnd_main, &point);
+                GetClientRect(g_app_ptr->hwnd_main, &rc);
+                ui_dock_panel(panel, point.x < rc.right / 2
+                              ? PANEL_DOCK_LEFT : PANEL_DOCK_RIGHT);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (g_panel_drag == panel) {
+            g_panel_drag = 0;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+            return 0;
+        }
+        break;
+
+    case WM_CAPTURECHANGED:
+        if ((HWND)lParam != hwnd && g_panel_drag == panel)
+            g_panel_drag = 0;
+        break;
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, panel_header_proc, subclass_id);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK status_bar_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR subclass_id, DWORD_PTR ref_data)
+{
+    (void)ref_data;
+
+    switch (msg) {
+    case SB_SETTEXTW:
+        if (LOWORD(wParam) == 0) {
+            wcsncpy_s(g_status_text, 256,
+                      lParam ? (const wchar_t *)lParam : L"", _TRUNCATE);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return TRUE;
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint;
+        RECT rc;
+        HDC dc = BeginPaint(hwnd, &paint);
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brush_panel ? g_brush_panel : (HBRUSH)(COLOR_BTNFACE + 1));
+        rc.left += 4;
+        rc.right -= 4;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, g_color_text);
+        SelectObject(dc, g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc, g_status_text, -1, &rc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, status_bar_proc, subclass_id);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK subfolders_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                        UINT_PTR subclass_id, DWORD_PTR ref_data)
+{
+    (void)wParam;
+    (void)lParam;
+    (void)ref_data;
+
+    if (msg == WM_PAINT && g_theme_is_dark) {
+        PAINTSTRUCT paint;
+        RECT rc;
+        RECT box;
+        RECT text_rect;
+        HBRUSH border;
+        HGDIOBJ old_font;
+        HDC dc = BeginPaint(hwnd, &paint);
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brush_panel);
+
+        box.left = 4;
+        box.top = (rc.bottom - 16) / 2;
+        box.right = box.left + 16;
+        box.bottom = box.top + 16;
+        FillRect(dc, &box, g_brush_window);
+        border = CreateSolidBrush(RGB(150, 150, 150));
+        FrameRect(dc, &box, border);
+        DeleteObject(border);
+
+        if (SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            HPEN pen = CreatePen(PS_SOLID, 2, g_color_text);
+            HGDIOBJ old_pen = SelectObject(dc, pen);
+            MoveToEx(dc, box.left + 3, box.top + 8, NULL);
+            LineTo(dc, box.left + 7, box.bottom - 3);
+            LineTo(dc, box.right - 2, box.top + 3);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+
+        text_rect = rc;
+        text_rect.left = box.right + 6;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, IsWindowEnabled(hwnd) ? g_color_text : RGB(145, 145, 145));
+        old_font = SelectObject(dc,
+                                g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc, L"Subfolders", -1, &text_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old_font);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    if (msg == WM_ERASEBKGND && g_theme_is_dark)
+        return 1;
+    if (msg == WM_NCDESTROY) {
+        LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+        RemoveWindowSubclass(hwnd, subfolders_proc, subclass_id);
+        return result;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
 /* =============================================================
  * Search edit subclass procedure
  * ============================================================= */
@@ -2136,8 +3271,18 @@ static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         ui_hide_horizontal_scrollbar(hwnd);
         return 0;
 
-    case WM_SIZE:
     case WM_NOTIFY:
+        if (lParam) {
+            NMHDR *notification = (NMHDR *)lParam;
+            if (notification->hwndFrom == ListView_GetHeader(hwnd) &&
+                notification->code == NM_CUSTOMDRAW)
+                return ui_custom_draw_list_header((NMCUSTOMDRAW *)lParam);
+        }
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+        ui_hide_horizontal_scrollbar(hwnd);
+        return result;
+
+    case WM_SIZE:
         result = DefSubclassProc(hwnd, msg, wParam, lParam);
         ui_hide_horizontal_scrollbar(hwnd);
         return result;

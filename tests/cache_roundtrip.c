@@ -1,0 +1,600 @@
+#include "cache.h"
+#include "index.h"
+#include "search.h"
+
+#include <psapi.h>
+#include <stdint.h>
+
+#define TEST_QUERY_COUNT 5
+
+static wchar_t g_test_config_path[MAX_PATH];
+
+typedef struct {
+    uint64_t hash;
+    uint64_t name_chars;
+    uint64_t path_chars;
+    uint64_t extension_chars;
+    int entry_count;
+} INDEX_FINGERPRINT;
+
+typedef struct {
+    int count;
+    uint64_t hash;
+} QUERY_FINGERPRINT;
+
+void config_get_path(wchar_t *buf, size_t size)
+{
+    wcscpy_s(buf, size, g_test_config_path);
+}
+
+static void set_cache_directory(const wchar_t *directory)
+{
+    size_t len = wcslen(directory);
+    swprintf_s(g_test_config_path, MAX_PATH, L"%ls%lsconfig.ini",
+               directory,
+               len > 0 && (directory[len - 1] == L'\\' || directory[len - 1] == L'/')
+                   ? L"" : L"\\");
+}
+
+static double elapsed_milliseconds(LARGE_INTEGER start, LARGE_INTEGER end,
+                                   LARGE_INTEGER frequency)
+{
+    return (double)(end.QuadPart - start.QuadPart) * 1000.0 /
+           (double)frequency.QuadPart;
+}
+
+static void hash_bytes(uint64_t *hash, const void *data, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)data;
+    for (size_t i = 0; i < size; i++) {
+        *hash ^= bytes[i];
+        *hash *= 1099511628211ULL;
+    }
+}
+
+static void hash_wstring(uint64_t *hash, const wchar_t *text, uint64_t *char_count)
+{
+    size_t len = text ? wcslen(text) : 0;
+    hash_bytes(hash, &len, sizeof(len));
+    if (len > 0)
+        hash_bytes(hash, text, len * sizeof(wchar_t));
+    if (char_count)
+        *char_count += len;
+}
+
+static INDEX_FINGERPRINT fingerprint_index(APP_STATE *app)
+{
+    INDEX_FINGERPRINT result;
+    memset(&result, 0, sizeof(result));
+    result.hash = 1469598103934665603ULL;
+    result.entry_count = app->entry_count;
+    hash_bytes(&result.hash, &app->volume_count, sizeof(app->volume_count));
+    hash_bytes(&result.hash, app->volumes,
+               (size_t)app->volume_count * sizeof(VOLUME_INFO));
+
+    for (int i = 0; i < app->entry_count; i++) {
+        const INDEX_ENTRY *entry = &app->entries[i];
+        hash_bytes(&result.hash, &entry->size, sizeof(entry->size));
+        hash_bytes(&result.hash, &entry->creation_time, sizeof(entry->creation_time));
+        hash_bytes(&result.hash, &entry->modification_time, sizeof(entry->modification_time));
+        hash_bytes(&result.hash, &entry->attributes, sizeof(entry->attributes));
+        hash_bytes(&result.hash, &entry->file_ref, sizeof(entry->file_ref));
+        hash_bytes(&result.hash, &entry->parent_ref, sizeof(entry->parent_ref));
+        hash_bytes(&result.hash, &entry->is_directory, sizeof(entry->is_directory));
+        hash_bytes(&result.hash, &entry->volume_index, sizeof(entry->volume_index));
+        hash_bytes(&result.hash, &entry->metadata_loaded, sizeof(entry->metadata_loaded));
+        hash_bytes(&result.hash, &entry->filter_type, sizeof(entry->filter_type));
+        hash_bytes(&result.hash, &entry->name_char_mask, sizeof(entry->name_char_mask));
+        hash_wstring(&result.hash, entry->name, &result.name_chars);
+        hash_wstring(&result.hash, index_entry_extension(entry),
+                     &result.extension_chars);
+        {
+            wchar_t *path = index_duplicate_entry_path_locked(app, i);
+            hash_wstring(&result.hash, path, &result.path_chars);
+            free(path);
+        }
+    }
+    return result;
+}
+
+static int fingerprint_queries(APP_STATE *app,
+                               QUERY_FINGERPRINT results[TEST_QUERY_COUNT],
+                               double elapsed_ms[TEST_QUERY_COUNT])
+{
+    static const struct {
+        const wchar_t *text;
+        int match_path;
+        int filter_id;
+    } cases[TEST_QUERY_COUNT] = {
+        { L"exe", 0, FILTER_EVERYTHING },
+        { L"ext:exe", 0, FILTER_EVERYTHING },
+        { L"windows", 1, FILTER_EVERYTHING },
+        { L"", 0, FILTER_IMAGE },
+        { L"*.dll", 0, FILTER_EVERYTHING }
+    };
+    int *indices = (int *)malloc(SEARCH_MAX_RESULTS * sizeof(int));
+    LARGE_INTEGER frequency;
+
+    if (!indices)
+        return 0;
+    QueryPerformanceFrequency(&frequency);
+
+    for (int i = 0; i < TEST_QUERY_COUNT; i++) {
+        SEARCH_QUERY query;
+        uint64_t hash = 1469598103934665603ULL;
+        double samples[3];
+        int count = 0;
+
+        memset(&query, 0, sizeof(query));
+        wcscpy_s(query.text, 512, cases[i].text);
+        query.match_path = cases[i].match_path;
+        query.filter_id = cases[i].filter_id;
+        query.include_subfolders = 1;
+        query.sort_column = COL_NAME;
+        query.sort_ascending = 1;
+        search_prepare_query(&query);
+        for (int sample = 0; sample < 3; sample++) {
+            LARGE_INTEGER start;
+            LARGE_INTEGER end;
+            QueryPerformanceCounter(&start);
+            count = search_execute_to_buffer(
+                app, &query, indices, SEARCH_MAX_RESULTS);
+            QueryPerformanceCounter(&end);
+            samples[sample] = elapsed_milliseconds(start, end, frequency);
+        }
+        if (samples[0] > samples[1]) {
+            double swap = samples[0]; samples[0] = samples[1]; samples[1] = swap;
+        }
+        if (samples[1] > samples[2]) {
+            double swap = samples[1]; samples[1] = samples[2]; samples[2] = swap;
+        }
+        if (samples[0] > samples[1]) {
+            double swap = samples[0]; samples[0] = samples[1]; samples[1] = swap;
+        }
+        if (elapsed_ms)
+            elapsed_ms[i] = samples[1];
+        hash_bytes(&hash, &count, sizeof(count));
+        for (int j = 0; j < count; j++) {
+            const INDEX_ENTRY *entry = &app->entries[indices[j]];
+            wchar_t *path;
+            hash_bytes(&hash, &entry->volume_index, sizeof(entry->volume_index));
+            hash_bytes(&hash, &entry->file_ref, sizeof(entry->file_ref));
+            path = index_duplicate_entry_path_locked(app, indices[j]);
+            hash_wstring(&hash, path, NULL);
+            free(path);
+        }
+        results[i].count = count;
+        results[i].hash = hash;
+    }
+
+    free(indices);
+    return 1;
+}
+
+static void destroy_app(APP_STATE *app)
+{
+    index_clear(app);
+    free(app->entries);
+    free(app->filtered_indices);
+    app->entries = NULL;
+    app->filtered_indices = NULL;
+    DeleteCriticalSection(&app->index_lock);
+}
+
+static int fingerprints_equal(const INDEX_FINGERPRINT *a,
+                              const INDEX_FINGERPRINT *b)
+{
+    return a->hash == b->hash &&
+           a->entry_count == b->entry_count &&
+           a->name_chars == b->name_chars &&
+           a->path_chars == b->path_chars &&
+           a->extension_chars == b->extension_chars;
+}
+
+static int compare_double(const void *lhs, const void *rhs)
+{
+    double a = *(const double *)lhs;
+    double b = *(const double *)rhs;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static int benchmark_load_directory(const wchar_t *directory, int expected_result,
+                                    LARGE_INTEGER frequency, double *milliseconds)
+{
+    APP_STATE app;
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    int result;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    QueryPerformanceCounter(&start);
+    result = cache_load_index(&app);
+    QueryPerformanceCounter(&end);
+    *milliseconds = elapsed_milliseconds(start, end, frequency);
+    destroy_app(&app);
+    return result == expected_result;
+}
+
+static int benchmark_search_directory(
+    const wchar_t *directory, int expected_result,
+    QUERY_FINGERPRINT results[TEST_QUERY_COUNT],
+    double elapsed_ms[TEST_QUERY_COUNT])
+{
+    APP_STATE app;
+    int result;
+    int ok;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    ok = result == expected_result &&
+         index_build_filter_index(&app) &&
+         index_build_ref_index(&app) &&
+         index_build_name_char_index(&app) &&
+         fingerprint_queries(&app, results, elapsed_ms);
+    destroy_app(&app);
+    return ok;
+}
+
+static int run_load_benchmark(const wchar_t *v3_directory,
+                              const wchar_t *v4_directory)
+{
+    enum { ITERATIONS = 5 };
+    LARGE_INTEGER frequency;
+    double v3_times[ITERATIONS];
+    double v4_times[ITERATIONS];
+    double v3_sorted[ITERATIONS];
+    double v4_sorted[ITERATIONS];
+
+    QueryPerformanceFrequency(&frequency);
+    for (int i = 0; i < ITERATIONS; i++) {
+        int ok;
+        if ((i & 1) == 0) {
+            ok = benchmark_load_directory(v3_directory, CACHE_LOAD_LEGACY,
+                                          frequency, &v3_times[i]) &&
+                 benchmark_load_directory(v4_directory, CACHE_LOAD_CURRENT,
+                                          frequency, &v4_times[i]);
+        } else {
+            ok = benchmark_load_directory(v4_directory, CACHE_LOAD_CURRENT,
+                                          frequency, &v4_times[i]) &&
+                 benchmark_load_directory(v3_directory, CACHE_LOAD_LEGACY,
+                                          frequency, &v3_times[i]);
+        }
+        if (!ok) {
+            fwprintf(stderr, L"Benchmark load failed at iteration %d\n", i);
+            return 1;
+        }
+        wprintf(L"iteration_%d_v3_ms=%.3f\n", i, v3_times[i]);
+        wprintf(L"iteration_%d_v4_ms=%.3f\n", i, v4_times[i]);
+    }
+
+    memcpy(v3_sorted, v3_times, sizeof(v3_times));
+    memcpy(v4_sorted, v4_times, sizeof(v4_times));
+    qsort(v3_sorted, ITERATIONS, sizeof(double), compare_double);
+    qsort(v4_sorted, ITERATIONS, sizeof(double), compare_double);
+    wprintf(L"v3_median_ms=%.3f\n", v3_sorted[ITERATIONS / 2]);
+    wprintf(L"v4_median_ms=%.3f\n", v4_sorted[ITERATIONS / 2]);
+    wprintf(L"load_ratio=%.4f\n",
+            v4_sorted[ITERATIONS / 2] / v3_sorted[ITERATIONS / 2]);
+    return 0;
+}
+
+static int run_search_benchmark(const wchar_t *v3_directory,
+                                const wchar_t *v4_directory)
+{
+    enum { ITERATIONS = 3 };
+    double v3_times[TEST_QUERY_COUNT][ITERATIONS];
+    double v4_times[TEST_QUERY_COUNT][ITERATIONS];
+    QUERY_FINGERPRINT v3_results[TEST_QUERY_COUNT];
+    QUERY_FINGERPRINT v4_results[TEST_QUERY_COUNT];
+
+    for (int i = 0; i < ITERATIONS; i++) {
+        double v3_sample[TEST_QUERY_COUNT];
+        double v4_sample[TEST_QUERY_COUNT];
+        int ok;
+
+        if ((i & 1) == 0) {
+            ok = benchmark_search_directory(
+                     v3_directory, CACHE_LOAD_LEGACY, v3_results, v3_sample) &&
+                 benchmark_search_directory(
+                     v4_directory, CACHE_LOAD_CURRENT, v4_results, v4_sample);
+        } else {
+            ok = benchmark_search_directory(
+                     v4_directory, CACHE_LOAD_CURRENT, v4_results, v4_sample) &&
+                 benchmark_search_directory(
+                     v3_directory, CACHE_LOAD_LEGACY, v3_results, v3_sample);
+        }
+        if (!ok) {
+            fwprintf(stderr, L"Search benchmark failed at iteration %d\n", i);
+            return 1;
+        }
+        for (int query = 0; query < TEST_QUERY_COUNT; query++) {
+            if (v3_results[query].count != v4_results[query].count ||
+                v3_results[query].hash != v4_results[query].hash) {
+                fwprintf(stderr, L"Search result mismatch at query %d\n", query);
+                return 1;
+            }
+            v3_times[query][i] = v3_sample[query];
+            v4_times[query][i] = v4_sample[query];
+        }
+    }
+
+    for (int query = 0; query < TEST_QUERY_COUNT; query++) {
+        qsort(v3_times[query], ITERATIONS, sizeof(double), compare_double);
+        qsort(v4_times[query], ITERATIONS, sizeof(double), compare_double);
+        wprintf(L"query_%d_count=%d\n", query, v4_results[query].count);
+        wprintf(L"query_%d_v3_median_ms=%.3f\n",
+                query, v3_times[query][ITERATIONS / 2]);
+        wprintf(L"query_%d_v4_median_ms=%.3f\n",
+                query, v4_times[query][ITERATIONS / 2]);
+        wprintf(L"query_%d_ratio=%.4f\n", query,
+                v4_times[query][ITERATIONS / 2] /
+                    v3_times[query][ITERATIONS / 2]);
+    }
+    return 0;
+}
+
+static int run_load_probe(const wchar_t *directory, int expected_result)
+{
+    APP_STATE app;
+    int result;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    destroy_app(&app);
+    wprintf(L"load_result=%d\n", result);
+    return result == expected_result ? 0 : 1;
+}
+
+static int run_memory_probe(const wchar_t *directory)
+{
+    APP_STATE app;
+    PROCESS_MEMORY_COUNTERS_EX counters;
+    int result;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    if (result == CACHE_LOAD_FAILED ||
+        !index_build_filter_index(&app) ||
+        !index_build_ref_index(&app) ||
+        !index_build_name_char_index(&app)) {
+        destroy_app(&app);
+        return 1;
+    }
+    memset(&counters, 0, sizeof(counters));
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              (PROCESS_MEMORY_COUNTERS *)&counters,
+                              sizeof(counters))) {
+        destroy_app(&app);
+        return 1;
+    }
+    wprintf(L"entries=%d\n", app.entry_count);
+    wprintf(L"entry_size=%zu\n", sizeof(INDEX_ENTRY));
+    wprintf(L"entry_capacity=%d\n", app.entry_capacity);
+    wprintf(L"ref_capacity=%d\n", app.ref_index_capacity);
+    wprintf(L"working_set_mb=%.2f\n",
+            (double)counters.WorkingSetSize / (1024.0 * 1024.0));
+    wprintf(L"private_mb=%.2f\n",
+            (double)counters.PrivateUsage / (1024.0 * 1024.0));
+    destroy_app(&app);
+    return 0;
+}
+
+static int run_query_probe(const wchar_t *directory)
+{
+    APP_STATE app;
+    QUERY_FINGERPRINT results[TEST_QUERY_COUNT];
+    double elapsed_ms[TEST_QUERY_COUNT];
+    int result;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    if (result == CACHE_LOAD_FAILED ||
+        !index_build_filter_index(&app) ||
+        !index_build_ref_index(&app) ||
+        !index_build_name_char_index(&app) ||
+        !fingerprint_queries(&app, results, elapsed_ms)) {
+        destroy_app(&app);
+        return 1;
+    }
+    for (int i = 0; i < TEST_QUERY_COUNT; i++) {
+        wprintf(L"query_%d_count=%d\n", i, results[i].count);
+        wprintf(L"query_%d_ms=%.3f\n", i, elapsed_ms[i]);
+        wprintf(L"query_%d_hash=%016llx\n", i, results[i].hash);
+    }
+    destroy_app(&app);
+    return 0;
+}
+
+static int run_leak_probe(const wchar_t *directory)
+{
+    APP_STATE app;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    for (int iteration = 0; iteration < 5; iteration++) {
+        PROCESS_MEMORY_COUNTERS_EX counters;
+        QUERY_FINGERPRINT query_results[TEST_QUERY_COUNT];
+        double query_ms[TEST_QUERY_COUNT];
+        int result;
+
+        index_clear(&app);
+        result = cache_load_index(&app);
+        if (result == CACHE_LOAD_FAILED ||
+            !index_build_filter_index(&app) ||
+            !index_build_ref_index(&app) ||
+            !index_build_name_char_index(&app) ||
+            !fingerprint_queries(&app, query_results, query_ms)) {
+            destroy_app(&app);
+            return 1;
+        }
+        HeapCompact(GetProcessHeap(), 0);
+        memset(&counters, 0, sizeof(counters));
+        counters.cb = sizeof(counters);
+        if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                                  (PROCESS_MEMORY_COUNTERS *)&counters,
+                                  sizeof(counters))) {
+            destroy_app(&app);
+            return 1;
+        }
+        wprintf(L"iteration_%d_private_mb=%.2f\n", iteration,
+                (double)counters.PrivateUsage / (1024.0 * 1024.0));
+        wprintf(L"iteration_%d_working_set_mb=%.2f\n", iteration,
+                (double)counters.WorkingSetSize / (1024.0 * 1024.0));
+    }
+    destroy_app(&app);
+    return 0;
+}
+
+int wmain(int argc, wchar_t **argv)
+{
+    APP_STATE app;
+    INDEX_FINGERPRINT v3_fingerprint;
+    INDEX_FINGERPRINT v4_fingerprint;
+    QUERY_FINGERPRINT v3_queries[TEST_QUERY_COUNT];
+    QUERY_FINGERPRINT v4_queries[TEST_QUERY_COUNT];
+    double v3_query_ms[TEST_QUERY_COUNT];
+    double v4_query_ms[TEST_QUERY_COUNT];
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    WIN32_FILE_ATTRIBUTE_DATA file_data;
+    wchar_t index_path[MAX_PATH];
+    double v3_load_ms;
+    double save_ms;
+    double v4_load_ms;
+    unsigned long long file_size;
+    int load_result;
+    int ok = 1;
+
+    if (argc == 4 && wcscmp(argv[1], L"--benchmark") == 0)
+        return run_load_benchmark(argv[2], argv[3]);
+    if (argc == 4 && wcscmp(argv[1], L"--search-benchmark") == 0)
+        return run_search_benchmark(argv[2], argv[3]);
+    if (argc == 4 && wcscmp(argv[1], L"--probe") == 0)
+        return run_load_probe(argv[2], _wtoi(argv[3]));
+    if (argc == 3 && wcscmp(argv[1], L"--memory-probe") == 0)
+        return run_memory_probe(argv[2]);
+    if (argc == 3 && wcscmp(argv[1], L"--query-probe") == 0)
+        return run_query_probe(argv[2]);
+    if (argc == 3 && wcscmp(argv[1], L"--leak-probe") == 0)
+        return run_leak_probe(argv[2]);
+
+    if (argc != 2) {
+        fwprintf(stderr,
+                 L"Usage: cache_roundtrip.exe TEST_CACHE_DIRECTORY\n"
+                 L"       cache_roundtrip.exe --benchmark V3_DIRECTORY V4_DIRECTORY\n"
+                 L"       cache_roundtrip.exe --search-benchmark V3_DIRECTORY V4_DIRECTORY\n"
+                 L"       cache_roundtrip.exe --probe DIRECTORY EXPECTED_RESULT\n");
+        return 2;
+    }
+
+    set_cache_directory(argv[1]);
+    QueryPerformanceFrequency(&frequency);
+
+    index_init(&app);
+    QueryPerformanceCounter(&start);
+    load_result = cache_load_index(&app);
+    QueryPerformanceCounter(&end);
+    v3_load_ms = elapsed_milliseconds(start, end, frequency);
+    if (load_result == CACHE_LOAD_FAILED) {
+        fwprintf(stderr, L"Source cache load failed\n");
+        destroy_app(&app);
+        return 1;
+    }
+
+    if (!index_build_ref_index(&app)) {
+        fwprintf(stderr, L"Failed to build V3 reference index\n");
+        destroy_app(&app);
+        return 1;
+    }
+    v3_fingerprint = fingerprint_index(&app);
+    if (!index_build_filter_index(&app) ||
+        !index_build_name_char_index(&app) ||
+        !fingerprint_queries(&app, v3_queries, v3_query_ms)) {
+        fwprintf(stderr, L"Failed to build V3 indexes or query fingerprints\n");
+        destroy_app(&app);
+        return 1;
+    }
+
+    QueryPerformanceCounter(&start);
+    ok = cache_save_index(&app);
+    QueryPerformanceCounter(&end);
+    save_ms = elapsed_milliseconds(start, end, frequency);
+    destroy_app(&app);
+    if (!ok) {
+        fwprintf(stderr, L"V4 cache save failed\n");
+        return 1;
+    }
+
+    cache_get_index_path(index_path, MAX_PATH);
+    if (!GetFileAttributesExW(index_path, GetFileExInfoStandard, &file_data)) {
+        fwprintf(stderr, L"Unable to stat V4 cache\n");
+        return 1;
+    }
+    file_size = ((unsigned long long)file_data.nFileSizeHigh << 32) |
+                file_data.nFileSizeLow;
+
+    index_init(&app);
+    QueryPerformanceCounter(&start);
+    load_result = cache_load_index(&app);
+    QueryPerformanceCounter(&end);
+    v4_load_ms = elapsed_milliseconds(start, end, frequency);
+    if (load_result != CACHE_LOAD_CURRENT) {
+        fwprintf(stderr, L"Expected V4 cache, load result was %d\n", load_result);
+        destroy_app(&app);
+        return 1;
+    }
+
+    if (!index_build_ref_index(&app)) {
+        fwprintf(stderr, L"Failed to build V4 reference index\n");
+        destroy_app(&app);
+        return 1;
+    }
+    v4_fingerprint = fingerprint_index(&app);
+    if (!index_build_filter_index(&app) ||
+        !index_build_name_char_index(&app) ||
+        !fingerprint_queries(&app, v4_queries, v4_query_ms)) {
+        fwprintf(stderr, L"Failed to build V4 indexes or query fingerprints\n");
+        destroy_app(&app);
+        return 1;
+    }
+
+    if (!fingerprints_equal(&v3_fingerprint, &v4_fingerprint)) {
+        fwprintf(stderr, L"Entry fingerprint mismatch: V3=%016llx V4=%016llx\n",
+                 v3_fingerprint.hash, v4_fingerprint.hash);
+        ok = 0;
+    }
+    for (int i = 0; i < TEST_QUERY_COUNT; i++) {
+        if (v3_queries[i].count != v4_queries[i].count ||
+            v3_queries[i].hash != v4_queries[i].hash) {
+            fwprintf(stderr,
+                     L"Query %d mismatch: V3=%d/%016llx V4=%d/%016llx\n",
+                     i, v3_queries[i].count, v3_queries[i].hash,
+                     v4_queries[i].count, v4_queries[i].hash);
+            ok = 0;
+        }
+    }
+
+    wprintf(L"entries=%d\n", v4_fingerprint.entry_count);
+    wprintf(L"v4_bytes=%llu\n", file_size);
+    wprintf(L"v3_load_ms=%.3f\n", v3_load_ms);
+    wprintf(L"v4_save_ms=%.3f\n", save_ms);
+    wprintf(L"v4_load_ms=%.3f\n", v4_load_ms);
+    wprintf(L"entry_hash=%016llx\n", v4_fingerprint.hash);
+    for (int i = 0; i < TEST_QUERY_COUNT; i++) {
+        wprintf(L"query_%d=%d/%016llx\n",
+                i, v4_queries[i].count, v4_queries[i].hash);
+        wprintf(L"query_%d_v3_ms=%.3f\n", i, v3_query_ms[i]);
+        wprintf(L"query_%d_v4_ms=%.3f\n", i, v4_query_ms[i]);
+    }
+    wprintf(L"roundtrip=%ls\n", ok ? L"PASS" : L"FAIL");
+
+    destroy_app(&app);
+    return ok ? 0 : 1;
+}

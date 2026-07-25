@@ -45,7 +45,7 @@ if errorlevel 1 (
 
 :: Compile flags
 set CFLAGS=/nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0600
-set LFLAGS=/nologo user32.lib kernel32.lib comctl32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib ole32.lib oleaut32.lib shlwapi.lib uxtheme.lib
+set LFLAGS=/nologo user32.lib kernel32.lib comctl32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib ole32.lib oleaut32.lib shlwapi.lib uxtheme.lib dwmapi.lib
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 

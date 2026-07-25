@@ -100,8 +100,6 @@ static int ntfs_grow_entries(INDEX_ENTRY **entries, int *capacity, int needed)
 
 static void ntfs_fill_entry_from_name(INDEX_ENTRY *e, const wchar_t *name, int name_len)
 {
-    const wchar_t *dot;
-    
     if (name_len < 0)
         name_len = (int)wcslen(name);
     
@@ -112,16 +110,6 @@ static void ntfs_fill_entry_from_name(INDEX_ENTRY *e, const wchar_t *name, int n
         e->name[name_len] = L'\0';
     }
     
-    e->path = NULL;
-    
-    dot = e->name ? wcsrchr(e->name, L'.') : NULL;
-    if (dot && dot[1]) {
-        e->extension = (wchar_t *)(dot + 1);
-        e->string_flags |= ENTRY_STRING_EXTENSION_POOLED;
-    } else {
-        e->extension = L"";
-        e->string_flags |= ENTRY_STRING_EXTENSION_POOLED;
-    }
 }
 
 int ntfs_update_volume_usn_info(HANDLE hVolume, VOLUME_INFO *volume)
@@ -207,13 +195,11 @@ int ntfs_read_usn_index(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_coun
                     e->size = 0;
                     e->creation_time = 0;
                     e->modification_time = 0;
-                    e->access_time = 0;
                     e->attributes = rec->FileAttributes;
                     e->file_ref = ntfs_ref_to_frn(rec->FileReferenceNumber);
                     e->parent_ref = ntfs_ref_to_frn(rec->ParentFileReferenceNumber);
                     e->is_directory = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
                     e->volume_index = volume_index;
-                    e->usn = rec->Usn;
                     entry_count++;
                 }
             }
@@ -475,8 +461,7 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
         unsigned int offset = hdr->FirstAttributeOffset;
         wchar_t name_buf[512] = {0};
         long long parent_frn = 0;
-        long long ctime = 0, mtime = 0, atime = 0;
-        long long usn = 0;
+        long long ctime = 0, mtime = 0;
         long long real_size = 0;
         unsigned int attrs = 0;
         int best_name_score = -1;
@@ -501,9 +486,7 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
                         STANDARD_INFORMATION *si = (STANDARD_INFORMATION *)value;
                         ctime = si->CreationTime;
                         mtime = si->ModificationTime;
-                        atime = si->AccessTime;
                         attrs = si->FileAttributes;
-                        usn = si->Usn;
                     }
                     else if (attr->Type == ATTR_FILE_NAME &&
                              res->ValueLength >= sizeof(FILE_NAME_ATTR)) {
@@ -527,7 +510,6 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
                                 real_size = fn->RealSize;
                                 if (!ctime) ctime = fn->CreationTime;
                                 if (!mtime) mtime = fn->ModificationTime;
-                                if (!atime) atime = fn->AccessTime;
                                 if (!attrs) attrs = fn->Flags;
                                 best_name_score = score;
                             }
@@ -556,25 +538,14 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
             e->name = (wchar_t *)malloc((name_len + 1) * sizeof(wchar_t));
             if (e->name) wcscpy_s(e->name, name_len + 1, name_buf);
             
-            e->path = _wcsdup(L"");
-            
-            const wchar_t *dot = wcsrchr(name_buf, L'.');
-            if (dot) {
-                e->extension = _wcsdup(dot + 1);
-            } else {
-                e->extension = _wcsdup(L"");
-            }
-            
             e->size = real_size;
             e->creation_time = ctime;
             e->modification_time = mtime;
-            e->access_time = atime;
             e->attributes = attrs;
             e->file_ref = frn;
             e->parent_ref = parent_frn;
             e->is_directory = (hdr->Flags & FR_DIRECTORY) ? 1 : 0;
             e->volume_index = volume_index;
-            e->usn = usn;
             e->metadata_loaded = 1;
              
             entry_count++;

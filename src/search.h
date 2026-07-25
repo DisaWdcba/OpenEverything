@@ -10,7 +10,7 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
                                     int *out_indices, int max_results,
                                     const int *base_indices, int base_count,
                                     int base_identity, LONG generation);
-int search_match_entry(INDEX_ENTRY *entry, const SEARCH_QUERY *query);
+int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *query);
 void search_sort_results(APP_STATE *app);
 void search_sort_indices(APP_STATE *app, const SEARCH_QUERY *query, int *indices, int count);
 

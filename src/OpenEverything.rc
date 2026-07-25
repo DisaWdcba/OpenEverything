@@ -3,3 +3,31 @@
 IDI_APP_ICON ICON "..\\res\\OpenEverything.ico"
 
 IDR_MAIN_MANIFEST 24 "OpenEverything.manifest"
+
+1 VERSIONINFO
+ FILEVERSION 0,1,9,0
+ PRODUCTVERSION 0,1,9,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "DisaWdcba\0"
+            VALUE "FileDescription", "OpenEverything\0"
+            VALUE "FileVersion", "0.1.9.0\0"
+            VALUE "InternalName", "OpenEverything\0"
+            VALUE "OriginalFilename", "OpenEverything.exe\0"
+            VALUE "ProductName", "OpenEverything\0"
+            VALUE "ProductVersion", "0.1.9\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

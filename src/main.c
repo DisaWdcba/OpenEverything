@@ -22,7 +22,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     
     /* Initialize common controls */
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc = {
+        sizeof(icc),
+        ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_STANDARD_CLASSES
+    };
     InitCommonControlsEx(&icc);
     
     /* Init application state */

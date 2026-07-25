@@ -1,7 +1,7 @@
 #include "search.h"
 #include "index.h"
 
-#define SEARCH_LOCK_CHUNK 4096
+#define SEARCH_LOCK_CHUNK 32768
 
 typedef struct {
     APP_STATE *app;
@@ -22,6 +22,46 @@ static wchar_t search_lower_char(wchar_t ch)
     if (ch < 128)
         return ch;
     return (wchar_t)towlower(ch);
+}
+
+static int search_matches_filter(const INDEX_ENTRY *entry, int filter_id)
+{
+    if (filter_id <= FILTER_EVERYTHING || filter_id >= FILTER_COUNT)
+        return 1;
+    return entry->filter_type == filter_id;
+}
+
+static int search_matches_folder(const wchar_t *path, const SEARCH_QUERY *query)
+{
+    const wchar_t *last;
+    size_t scope_len;
+    size_t path_len;
+
+    if (!query->folder_scope[0])
+        return 1;
+    if (!path)
+        path = L"";
+    scope_len = wcslen(query->folder_scope);
+    path_len = wcslen(path);
+
+    if (query->include_subfolders) {
+        if (path_len <= scope_len ||
+            _wcsnicmp(path, query->folder_scope, scope_len) != 0)
+            return 0;
+        if (query->folder_scope[scope_len - 1] == L'\\')
+            return 1;
+        return path[scope_len] == L'\\';
+    }
+
+    last = wcsrchr(path, L'\\');
+    if (!last)
+        return 0;
+    if (scope_len == 3 && query->folder_scope[1] == L':' &&
+        query->folder_scope[2] == L'\\') {
+        return last == path + 2 && _wcsnicmp(path, query->folder_scope, 2) == 0;
+    }
+    return (size_t)(last - path) == scope_len &&
+           _wcsnicmp(path, query->folder_scope, scope_len) == 0;
 }
 
 static int search_mask_slot(wchar_t ch)
@@ -181,14 +221,22 @@ void search_prepare_query(SEARCH_QUERY *query)
     }
 }
 
-static int compare_entries_for_query(const INDEX_ENTRY *a, const INDEX_ENTRY *b, int column)
+static int compare_entries_for_query(APP_STATE *app, int ia, int ib, int column)
 {
+    INDEX_ENTRY *a = &app->entries[ia];
+    INDEX_ENTRY *b = &app->entries[ib];
     int result = 0;
     
     switch (column) {
         case COL_PATH:
-            result = _wcsicmp(a->path ? a->path : L"", b->path ? b->path : L"");
+        {
+            wchar_t *apath = index_duplicate_entry_path_locked(app, ia);
+            wchar_t *bpath = index_duplicate_entry_path_locked(app, ib);
+            result = _wcsicmp(apath ? apath : L"", bpath ? bpath : L"");
+            free(apath);
+            free(bpath);
             break;
+        }
         case COL_SIZE:
             result = compare_int64(a->size, b->size);
             break;
@@ -204,13 +252,9 @@ static int compare_entries_for_query(const INDEX_ENTRY *a, const INDEX_ENTRY *b,
             break;
         case COL_NAME:
         default:
-            result = wcscmp(a->folded_name ? a->folded_name : (a->name ? a->name : L""),
-                            b->folded_name ? b->folded_name : (b->name ? b->name : L""));
+            result = _wcsicmp(a->name ? a->name : L"", b->name ? b->name : L"");
             break;
     }
-    
-    if (result == 0)
-        result = _wcsicmp(a->path ? a->path : L"", b->path ? b->path : L"");
     if (result == 0)
         result = compare_int64(a->file_ref, b->file_ref);
     
@@ -230,9 +274,40 @@ static int compare_filtered_indices_ctx(void *ctx, const void *lhs, const void *
     if (a->is_directory != b->is_directory)
         return a->is_directory ? -1 : 1;
 
-    result = compare_entries_for_query(a, b, sort->query->sort_column);
+    result = compare_entries_for_query(sort->app, ia, ib, sort->query->sort_column);
     
     return sort->query->sort_ascending ? result : -result;
+}
+
+static int search_sort_nearly_ordered(int *indices, int count, SORT_CONTEXT *ctx)
+{
+    int repairs = 0;
+
+    for (int i = 1; i < count; i++) {
+        int value;
+        int lo;
+        int hi;
+
+        if (compare_filtered_indices_ctx(ctx, &indices[i - 1], &indices[i]) <= 0)
+            continue;
+        if (++repairs > 64)
+            return 0;
+
+        value = indices[i];
+        lo = 0;
+        hi = i;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (compare_filtered_indices_ctx(ctx, &indices[mid], &value) <= 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        memmove(indices + lo + 1, indices + lo,
+                (size_t)(i - lo) * sizeof(*indices));
+        indices[lo] = value;
+    }
+    return 1;
 }
 
 static int match_wildcard(const wchar_t *text, const wchar_t *pattern, int case_sensitive)
@@ -287,13 +362,33 @@ static int match_whole_word(const wchar_t *text, const wchar_t *word, int case_s
     return 0;
 }
 
-int search_match_entry(INDEX_ENTRY *entry, const SEARCH_QUERY *query)
+int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *query)
 {
-    if (!query->text[0]) return 1;
-    
-    const wchar_t *target = query->match_path ? entry->path : entry->name;
-    const wchar_t *folded_target = query->match_path ? NULL : entry->folded_name;
-    if (!target) return 0;
+    INDEX_ENTRY *entry;
+    wchar_t *path = NULL;
+    const wchar_t *target;
+    int matched = 0;
+
+    if (!app || entry_index < 0 || entry_index >= app->entry_count || !query)
+        return 0;
+    entry = &app->entries[entry_index];
+    if (!search_matches_filter(entry, query->filter_id))
+        return 0;
+    if (query->match_path || query->folder_scope[0]) {
+        path = index_duplicate_entry_path_locked(app, entry_index);
+        if (!path)
+            return 0;
+    }
+    if (!search_matches_folder(path, query)) {
+        free(path);
+        return 0;
+    }
+    target = query->match_path ? path : entry->name;
+    if (!query->text[0]) {
+        matched = 1;
+        goto done;
+    }
+    if (!target) goto done;
     
     /* Handle special type filters */
     if (wcsstr(query->text, L"ext:")) {
@@ -305,44 +400,50 @@ int search_match_entry(INDEX_ENTRY *entry, const SEARCH_QUERY *query)
         wchar_t *ctx = NULL;
         wchar_t *ext = wcstok_s(exts_copy, L";", &ctx);
         while (ext) {
-            if (_wcsicmp(entry->extension ? entry->extension : L"", ext) == 0) return 1;
+            if (_wcsicmp(index_entry_extension(entry), ext) == 0) {
+                matched = 1;
+                goto done;
+            }
             ext = wcstok_s(NULL, L";", &ctx);
         }
-        return 0;
+        goto done;
     }
     
     if (wcsstr(query->text, L"folder:")) {
-        return entry->is_directory ? 1 : 0;
+        matched = entry->is_directory ? 1 : 0;
+        goto done;
     }
     
     if (query->char_mask) {
-        unsigned long long entry_mask = query->match_path
-            ? entry->path_char_mask
-            : entry->name_char_mask;
-        if ((entry_mask & query->char_mask) != query->char_mask)
-            return 0;
+        if (!query->match_path &&
+            (entry->name_char_mask & query->char_mask) != query->char_mask)
+            goto done;
     }
     
     /* Regular matching */
     if (query->match_whole_word) {
-        return match_whole_word(target, query->text, query->match_case);
+        matched = match_whole_word(target, query->text, query->match_case);
+        goto done;
     }
     
     if (!wcschr(query->text, L'*') && !wcschr(query->text, L'?')) {
-        return query->match_case
+        matched = query->match_case
             ? (wcsstr(target, query->text) != NULL)
             : (query->folded_ready
-                ? (folded_target
-                    ? search_contains_pre_folded(folded_target, query->folded_text, query->text_len)
-                    : search_contains_folded(target, query->folded_text, query->text_len))
+                ? search_contains_folded(target, query->folded_text, query->text_len)
                 : search_contains_ignore_case(target, query->text));
+        goto done;
     }
     
     /* Wildcard match - wrap with * if no wildcards */
     wchar_t pattern[512];
     wcscpy_s(pattern, 512, query->text);
     
-    return match_wildcard(target, pattern, query->match_case);
+    matched = match_wildcard(target, pattern, query->match_case);
+
+done:
+    free(path);
+    return matched;
 }
 
 void search_sort_results(APP_STATE *app)
@@ -359,6 +460,9 @@ void search_sort_indices(APP_STATE *app, const SEARCH_QUERY *query, int *indices
     
     ctx.app = app;
     ctx.query = query;
+    if (query->sort_column == COL_NAME && query->sort_ascending &&
+        search_sort_nearly_ordered(indices, count, &ctx))
+        return;
     qsort_s(indices, count, sizeof(int), compare_filtered_indices_ctx, &ctx);
 }
 
@@ -371,7 +475,7 @@ void search_execute(APP_STATE *app)
     app->filtered_count = 0;
     
     for (int i = 0; i < app->entry_count && app->filtered_count < SEARCH_MAX_RESULTS; i++) {
-        if (search_match_entry(&app->entries[i], &app->query)) {
+        if (search_match_entry(app, i, &app->query)) {
             app->filtered_indices[app->filtered_count++] = i;
         }
     }
@@ -389,11 +493,69 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
     int count = 0;
     int i = 0;
     int fast_slot = -1;
+    int fast_filter = -1;
     
     if (!out_indices || max_results <= 0)
         return 0;
+
+    if (!query->text[0] && !query->folder_scope[0] &&
+        query->filter_id >= FILTER_EVERYTHING && query->filter_id < FILTER_COUNT) {
+        int ready;
+        int indexed_count;
+        int directory_count;
+
+        EnterCriticalSection(&app->index_lock);
+        ready = app->filter_index_ready;
+        indexed_count = ready ? app->filter_counts[query->filter_id] : 0;
+        directory_count = ready ? app->filter_counts[FILTER_FOLDER] : 0;
+        if (ready && query->filter_id == FILTER_EVERYTHING) {
+            int folder_copy = directory_count < max_results
+                ? directory_count : max_results;
+            if (folder_copy > 0)
+                memcpy(out_indices, app->filter_indices[FILTER_FOLDER],
+                       (size_t)folder_copy * sizeof(*out_indices));
+            count = folder_copy;
+            for (int n = 0; n < app->entry_count && count < max_results; n++) {
+                if (!app->entries[n].is_directory)
+                    out_indices[count++] = n;
+            }
+        } else {
+            count = indexed_count < max_results ? indexed_count : max_results;
+            if (ready && count > 0)
+                memcpy(out_indices, app->filter_indices[query->filter_id],
+                       (size_t)count * sizeof(*out_indices));
+        }
+        LeaveCriticalSection(&app->index_lock);
+
+        if (ready) {
+            if (query->sort_column == COL_NAME) {
+                if (!query->sort_ascending) {
+                    int boundary = query->filter_id == FILTER_EVERYTHING
+                        ? (directory_count < count ? directory_count : count) : count;
+                    for (int left = 0, right = boundary - 1;
+                         left < right; left++, right--) {
+                        int swap = out_indices[left];
+                        out_indices[left] = out_indices[right];
+                        out_indices[right] = swap;
+                    }
+                    for (int left = boundary, right = count - 1;
+                         left < right; left++, right--) {
+                        int swap = out_indices[left];
+                        out_indices[left] = out_indices[right];
+                        out_indices[right] = swap;
+                    }
+                }
+            } else if (generation == app->search_generation) {
+                EnterCriticalSection(&app->index_lock);
+                search_sort_indices(app, query, out_indices, count);
+                LeaveCriticalSection(&app->index_lock);
+            }
+            return count;
+        }
+    }
     
-    if (!query->text[0]) {
+    if (!query->text[0] && query->filter_id == FILTER_EVERYTHING &&
+        !query->folder_scope[0]) {
         int entry_count;
         int limit;
         
@@ -413,14 +575,54 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
         LeaveCriticalSection(&app->index_lock);
         return count;
     }
-    
+
     EnterCriticalSection(&app->index_lock);
-    if (!base_indices && !base_identity &&
-        search_query_has_plain_name_fast_path(query))
-        fast_slot = search_best_name_char_slot(app, query);
+    if (!base_indices && !base_identity) {
+        if (search_query_has_plain_name_fast_path(query))
+            fast_slot = search_best_name_char_slot(app, query);
+        if (query->filter_id > FILTER_EVERYTHING &&
+            query->filter_id < FILTER_COUNT && app->filter_index_ready) {
+            int filter_count = app->filter_counts[query->filter_id];
+            if (fast_slot < 0 || filter_count <= app->name_char_counts[fast_slot]) {
+                fast_filter = query->filter_id;
+                fast_slot = -1;
+            }
+        }
+    }
     LeaveCriticalSection(&app->index_lock);
     
-    if (fast_slot >= 0) {
+    if (fast_filter >= 0) {
+        for (;;) {
+            int end;
+            int entry_count;
+            int filter_count;
+            int *filter_indices;
+
+            EnterCriticalSection(&app->index_lock);
+            entry_count = app->entry_count;
+            filter_count = app->filter_counts[fast_filter];
+            filter_indices = app->filter_indices[fast_filter];
+            if (!app->filter_index_ready ||
+                i >= filter_count || count >= max_results) {
+                LeaveCriticalSection(&app->index_lock);
+                break;
+            }
+
+            end = i + SEARCH_LOCK_CHUNK;
+            if (end > filter_count)
+                end = filter_count;
+            for (; i < end && count < max_results; i++) {
+                int idx = filter_indices ? filter_indices[i] : -1;
+                if (idx >= 0 && idx < entry_count &&
+                    search_match_entry(app, idx, query))
+                    out_indices[count++] = idx;
+            }
+
+            LeaveCriticalSection(&app->index_lock);
+            if (generation != app->search_generation)
+                break;
+        }
+    } else if (fast_slot >= 0) {
         for (;;) {
             int end;
             int entry_count;
@@ -445,14 +647,13 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
             for (; i < end && count < max_results; i++) {
                 int idx = slot_indices ? slot_indices[i] : -1;
                 if (idx >= 0 && idx < entry_count &&
-                    search_match_entry(&app->entries[idx], query))
+                    search_match_entry(app, idx, query))
                     out_indices[count++] = idx;
             }
             
             LeaveCriticalSection(&app->index_lock);
             if (generation != app->search_generation)
                 break;
-            Sleep(0);
         }
     } else if ((base_indices || base_identity) && base_count > 0) {
         for (;;) {
@@ -474,14 +675,13 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
             for (; i < end && count < max_results; i++) {
                 int idx = base_identity ? i : base_indices[i];
                 if (idx >= 0 && idx < entry_count &&
-                    search_match_entry(&app->entries[idx], query))
+                    search_match_entry(app, idx, query))
                     out_indices[count++] = idx;
             }
             
             LeaveCriticalSection(&app->index_lock);
             if (generation != app->search_generation)
                 break;
-            Sleep(0);
         }
     } else {
         for (;;) {
@@ -501,14 +701,13 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
                 end = entry_count;
             
             for (; i < end && count < max_results; i++) {
-                if (search_match_entry(&app->entries[i], query))
+                if (search_match_entry(app, i, query))
                     out_indices[count++] = i;
             }
             
             LeaveCriticalSection(&app->index_lock);
             if (generation != app->search_generation)
                 break;
-            Sleep(0);
         }
     }
     
