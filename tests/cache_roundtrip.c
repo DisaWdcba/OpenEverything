@@ -84,7 +84,6 @@ static INDEX_FINGERPRINT fingerprint_index(APP_STATE *app)
         hash_bytes(&result.hash, &entry->volume_index, sizeof(entry->volume_index));
         hash_bytes(&result.hash, &entry->metadata_loaded, sizeof(entry->metadata_loaded));
         hash_bytes(&result.hash, &entry->filter_type, sizeof(entry->filter_type));
-        hash_bytes(&result.hash, &entry->name_char_mask, sizeof(entry->name_char_mask));
         hash_wstring(&result.hash, entry->name, &result.name_chars);
         hash_wstring(&result.hash, index_entry_extension(entry),
                      &result.extension_chars);
@@ -179,6 +178,108 @@ static void destroy_app(APP_STATE *app)
     app->entries = NULL;
     app->filtered_indices = NULL;
     DeleteCriticalSection(&app->index_lock);
+}
+
+static int add_ref_test_entry(APP_STATE *app, const wchar_t *name,
+                              long long file_ref, long long parent_ref,
+                              int is_directory)
+{
+    INDEX_ENTRY entry;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.name = _wcsdup(name);
+    if (!entry.name)
+        return 0;
+    entry.file_ref = file_ref;
+    entry.parent_ref = parent_ref;
+    entry.volume_index = 0;
+    entry.is_directory = (unsigned char)(is_directory != 0);
+    entry.attributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    entry.parent_index = INDEX_PARENT_UNKNOWN;
+    if (!index_add_entry(app, &entry)) {
+        index_free_entry(&entry);
+        return 0;
+    }
+    return 1;
+}
+
+static int find_ref_test_entry(const APP_STATE *app, long long file_ref)
+{
+    for (int i = 0; i < app->entry_count; i++) {
+        if (app->entries[i].volume_index == 0 &&
+            app->entries[i].file_ref == file_ref)
+            return i;
+    }
+    return -1;
+}
+
+static int ref_test_path_equals(APP_STATE *app, long long file_ref,
+                                const wchar_t *expected)
+{
+    int index = find_ref_test_entry(app, file_ref);
+    wchar_t *path;
+    int equal;
+
+    if (index < 0)
+        return 0;
+    path = index_duplicate_entry_path_locked(app, index);
+    equal = path && wcscmp(path, expected) == 0;
+    free(path);
+    return equal;
+}
+
+static int run_ref_index_mutation_probe(void)
+{
+    APP_STATE app;
+    USN_CHANGE change;
+    int ok = 1;
+
+    index_init(&app);
+    app.volume_count = 1;
+    wcscpy_s(app.volumes[0].drive_letter, 4, L"C:\\");
+
+    ok = add_ref_test_entry(&app, L".", 5, 5, 1) &&
+         add_ref_test_entry(&app, L"parent", 10, 5, 1) &&
+         add_ref_test_entry(&app, L"victim.txt", 11, 10, 0) &&
+         add_ref_test_entry(&app, L"moved", 12, 10, 1) &&
+         index_build_ref_index(&app) &&
+         ref_test_path_equals(&app, 12, L"C:\\parent\\moved");
+
+    memset(&change, 0, sizeof(change));
+    change.file_ref = 11;
+    change.volume_index = 0;
+    change.reason = USN_REASON_FILE_DELETE;
+    if (ok)
+        ok = index_apply_usn_changes(&app, &change, 1) == 1 &&
+             ref_test_path_equals(&app, 12, L"C:\\parent\\moved");
+
+    memset(&change, 0, sizeof(change));
+    change.name = L"renamed";
+    change.file_ref = 12;
+    change.parent_ref = 10;
+    change.volume_index = 0;
+    change.is_directory = 1;
+    change.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    change.reason = USN_REASON_RENAME_NEW_NAME;
+    if (ok)
+        ok = index_apply_usn_changes(&app, &change, 1) == 1 &&
+             ref_test_path_equals(&app, 12, L"C:\\parent\\renamed");
+
+    memset(&change, 0, sizeof(change));
+    change.name = L"child.bin";
+    change.file_ref = 13;
+    change.parent_ref = 12;
+    change.volume_index = 0;
+    change.attributes = FILE_ATTRIBUTE_NORMAL;
+    change.reason = USN_REASON_FILE_CREATE;
+    if (ok)
+        ok = index_apply_usn_changes(&app, &change, 1) == 1 &&
+             ref_test_path_equals(&app, 13,
+                                  L"C:\\parent\\renamed\\child.bin");
+
+    wprintf(L"ref_index_mutation=%ls\n", ok ? L"PASS" : L"FAIL");
+    destroy_app(&app);
+    return ok ? 0 : 1;
 }
 
 static int fingerprints_equal(const INDEX_FINGERPRINT *a,
@@ -484,13 +585,16 @@ int wmain(int argc, wchar_t **argv)
         return run_query_probe(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"--leak-probe") == 0)
         return run_leak_probe(argv[2]);
+    if (argc == 2 && wcscmp(argv[1], L"--ref-index-probe") == 0)
+        return run_ref_index_mutation_probe();
 
     if (argc != 2) {
         fwprintf(stderr,
                  L"Usage: cache_roundtrip.exe TEST_CACHE_DIRECTORY\n"
                  L"       cache_roundtrip.exe --benchmark V3_DIRECTORY V4_DIRECTORY\n"
                  L"       cache_roundtrip.exe --search-benchmark V3_DIRECTORY V4_DIRECTORY\n"
-                 L"       cache_roundtrip.exe --probe DIRECTORY EXPECTED_RESULT\n");
+                 L"       cache_roundtrip.exe --probe DIRECTORY EXPECTED_RESULT\n"
+                 L"       cache_roundtrip.exe --ref-index-probe\n");
         return 2;
     }
 

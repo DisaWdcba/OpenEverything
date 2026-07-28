@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "version.h"
 #include "config.h"
 #include "ipc.h"
 #include "ntfs.h"
@@ -230,6 +231,33 @@ struct ReindexCtx {
     HWND hwnd;
 };
 
+/* System DPI, sampled once at startup. The process is system-DPI aware (see
+   wWinMain), so this is fixed for the window's lifetime. Sizes stored in the
+   config are kept in 96-DPI logical units and scaled through these helpers, so
+   a layout tuned on a 4K display stays sane on a 1080p one. */
+static int g_dpi = 96;
+
+static void ui_init_dpi(void)
+{
+    HDC screen = GetDC(NULL);
+    if (screen) {
+        int dpi = GetDeviceCaps(screen, LOGPIXELSY);
+        ReleaseDC(NULL, screen);
+        if (dpi >= 96 && dpi <= 960)
+            g_dpi = dpi;
+    }
+}
+
+static int ui_scale(int logical)
+{
+    return MulDiv(logical, g_dpi, 96);
+}
+
+static int ui_unscale(int physical)
+{
+    return MulDiv(physical, 96, g_dpi);
+}
+
 static void ui_init_visual_resources(void)
 {
     g_color_window = RGB(255, 255, 255);
@@ -241,7 +269,7 @@ static void ui_init_visual_resources(void)
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     }
-    
+
     if (!g_font_search) {
         g_font_search = CreateFontW(
             -20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -909,6 +937,15 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     int loaded;
     
     loaded = cache_load_index(ctx->app);
+    if (loaded == CACHE_LOAD_LEGACY && !ctx->app->shutting_down &&
+        cache_save_index(ctx->app)) {
+        int reloaded = cache_load_index(ctx->app);
+        if (reloaded == CACHE_LOAD_CURRENT) {
+            loaded = reloaded;
+            if (!ctx->app->shutting_down)
+                PostMessageW(ctx->hwnd, WM_CACHE_UPGRADE_DONE, 0, 0);
+        }
+    }
     if (loaded && !ctx->app->shutting_down) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         index_build_filter_index(ctx->app);
@@ -918,11 +955,6 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     if (!ctx->app->shutting_down)
         PostMessageW(ctx->hwnd, loaded ? WM_CACHE_LOADED : WM_REFRESH,
                      (WPARAM)loaded, 0);
-    if (loaded == CACHE_LOAD_LEGACY && !ctx->app->shutting_down) {
-        cache_save_index(ctx->app);
-        if (!ctx->app->shutting_down)
-            PostMessageW(ctx->hwnd, WM_CACHE_UPGRADE_DONE, 0, 0);
-    }
     if (loaded && !ctx->app->shutting_down) {
         index_build_name_char_index(ctx->app);
     }
@@ -1194,9 +1226,16 @@ static DWORD WINAPI usn_startup_sync_thread_proc(void *p)
         int needs_rebuild = 0;
         int changed_count = 0;
         int sync_ok = usn_sync_once(app, &needs_rebuild, &changed_count);
-        
-        if (!sync_ok || needs_rebuild)
+
+        if (!sync_ok || needs_rebuild) {
+            /* The journal was recreated, or it wrapped past the USN we stopped
+               at, so the incremental stream can no longer be trusted. Hand the
+               rebuild to the UI thread: just ending the loop here left the
+               index frozen with nothing to tell the user it had stopped. */
+            if (needs_rebuild && !app->shutting_down)
+                PostMessageW(hwnd, WM_REFRESH, 0, 0);
             break;
+        }
         if (changed_count > 0) {
             idle_cycles = 0;
             filter_index_pending = !index_build_filter_index(app);
@@ -1330,7 +1369,9 @@ static DWORD WINAPI reindex_thread_proc(void *p)
 int ui_init(HINSTANCE hInst)
 {
     g_hInst = hInst;
-    
+
+    ui_init_dpi();
+
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
     wc.style = 0;
@@ -1356,26 +1397,58 @@ int ui_init(HINSTANCE hInst)
 /* =============================================================
  * Create main window
  * ============================================================= */
+/* True when the saved rect still overlaps a live monitor. Display setups
+   change between runs; restoring onto a monitor that is gone would put the
+   window somewhere the user cannot reach it. */
+static int ui_placement_is_visible(int x, int y, int width, int height)
+{
+    RECT rect;
+    rect.left = x;
+    rect.top = y;
+    rect.right = x + width;
+    rect.bottom = y + height;
+    return MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) != NULL;
+}
+
 HWND ui_create_main_window(HINSTANCE hInst, int nCmdShow, APP_STATE *app)
 {
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    int width = ui_scale(DEFAULT_WINDOW_WIDTH);
+    int height = ui_scale(DEFAULT_WINDOW_HEIGHT);
+
     g_app_ptr = app;
     app->hinst = hInst;
-    
+
+    if (app->window_width > 0 && app->window_height > 0) {
+        int saved_w = ui_scale(app->window_width);
+        int saved_h = ui_scale(app->window_height);
+        if (ui_placement_is_visible(app->window_x, app->window_y,
+                                    saved_w, saved_h)) {
+            x = app->window_x;
+            y = app->window_y;
+            width = saved_w;
+            height = saved_h;
+        }
+    }
+
     HWND hwnd = CreateWindowExW(
         0,
         WC_EVERYTHING,
         L"OpenEverything",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
+        x, y,
+        width, height,
         NULL, NULL, hInst, NULL);
-    
+
     if (!hwnd) return NULL;
-    
+
     app->hwnd_main = hwnd;
+    if (app->window_maximized && nCmdShow != SW_SHOWMINIMIZED)
+        nCmdShow = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-    
+
     return hwnd;
 }
 
@@ -1637,16 +1710,67 @@ static void ui_update_view_menu(void)
                            MF_BYCOMMAND);
 }
 
+static void ui_apply_titlebar_theme(HWND hwnd, int dark)
+{
+    typedef struct {
+        int attribute;
+        PVOID data;
+        SIZE_T data_size;
+    } UI_WINDOWCOMPOSITIONATTRIBDATA;
+    typedef BOOL (WINAPI *SetWindowCompositionAttributeFn)(
+        HWND, UI_WINDOWCOMPOSITIONATTRIBDATA *);
+    SetWindowCompositionAttributeFn set_window_composition;
+    UI_WINDOWCOMPOSITIONATTRIBDATA composition_data;
+    BOOL dark_title = dark ? TRUE : FALSE;
+    HRESULT dark_mode_result;
+    int nc_rendering_policy;
+
+    dark_mode_result = DwmSetWindowAttribute(
+        hwnd, 20, &dark_title, sizeof(dark_title));
+    if (FAILED(dark_mode_result))
+        DwmSetWindowAttribute(hwnd, 19, &dark_title, sizeof(dark_title));
+
+    set_window_composition = (SetWindowCompositionAttributeFn)GetProcAddress(
+        GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+    if (set_window_composition) {
+        composition_data.attribute = 26; /* WCA_USEDARKMODECOLORS */
+        composition_data.data = &dark_title;
+        composition_data.data_size = sizeof(dark_title);
+        set_window_composition(hwnd, &composition_data);
+    }
+
+    /* On Windows 10 the dark-mode attribute changes immediately, but DWM can
+       keep presenting the old caption surface. Recreate that surface through
+       the documented non-client rendering policy; synthesizing WM_NCACTIVATE
+       makes DefWindowProc draw a classic caption fragment over the DWM frame. */
+    nc_rendering_policy = 1; /* DWMNCRP_DISABLED */
+    if (SUCCEEDED(DwmSetWindowAttribute(
+            hwnd, 2, &nc_rendering_policy, sizeof(nc_rendering_policy)))) {
+        DwmFlush();
+        nc_rendering_policy = 2; /* DWMNCRP_ENABLED */
+        DwmSetWindowAttribute(
+            hwnd, 2, &nc_rendering_policy, sizeof(nc_rendering_policy));
+    }
+
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(hwnd, NULL, NULL,
+                 RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    DwmFlush();
+}
+
 static void ui_apply_theme(HWND hwnd)
 {
     typedef int (WINAPI *SetPreferredAppModeFn)(int);
+    typedef void (WINAPI *RefreshImmersiveColorPolicyStateFn)(void);
     typedef void (WINAPI *FlushMenuThemesFn)(void);
     typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
     HMODULE uxtheme;
     SetPreferredAppModeFn set_preferred_mode;
-    FlushMenuThemesFn flush_menu_themes;
-    AllowDarkModeForWindowFn allow_dark_window;
-    BOOL dark_title;
+    RefreshImmersiveColorPolicyStateFn refresh_color_policy;
+    FlushMenuThemesFn flush_menu_themes = NULL;
+    AllowDarkModeForWindowFn allow_dark_window = NULL;
     int dark;
     HWND themed[] = {
         g_hwndSearch, g_hwndList, ListView_GetHeader(g_hwndList), g_hwndStatus,
@@ -1666,14 +1790,24 @@ static void ui_apply_theme(HWND hwnd)
     if (uxtheme) {
         set_preferred_mode = (SetPreferredAppModeFn)GetProcAddress(
             uxtheme, (LPCSTR)(ULONG_PTR)135);
+        refresh_color_policy = (RefreshImmersiveColorPolicyStateFn)GetProcAddress(
+            uxtheme, (LPCSTR)(ULONG_PTR)104);
         flush_menu_themes = (FlushMenuThemesFn)GetProcAddress(
             uxtheme, (LPCSTR)(ULONG_PTR)136);
         allow_dark_window = (AllowDarkModeForWindowFn)GetProcAddress(
             uxtheme, (LPCSTR)(ULONG_PTR)133);
         if (set_preferred_mode)
             set_preferred_mode(dark ? 2 : 3);
-        if (allow_dark_window) {
+        if (refresh_color_policy)
+            refresh_color_policy();
+        if (allow_dark_window)
             allow_dark_window(hwnd, dark);
+    }
+
+    ui_apply_titlebar_theme(hwnd, dark);
+
+    if (uxtheme) {
+        if (allow_dark_window) {
             for (int i = 0; i < (int)(sizeof(themed) / sizeof(themed[0])); i++) {
                 if (themed[i])
                     allow_dark_window(themed[i], dark);
@@ -1703,16 +1837,11 @@ static void ui_apply_theme(HWND hwnd)
     InvalidateRect(ListView_GetHeader(g_hwndList), NULL, TRUE);
     InvalidateRect(g_hwndStatus, NULL, TRUE);
     InvalidateRect(g_hwndSubfolders, NULL, TRUE);
-    dark_title = dark;
-    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dark_title, sizeof(dark_title))))
-        DwmSetWindowAttribute(hwnd, 19, &dark_title, sizeof(dark_title));
     ui_update_view_menu();
     DrawMenuBar(hwnd);
-    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
     RedrawWindow(hwnd, NULL, NULL,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
+                 RDW_UPDATENOW);
 }
 
 static void ui_apply_layout(HWND hwnd)
@@ -2167,10 +2296,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         LVCOLUMNW col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         
-        col.pszText = L"Name";          col.cx = app->column_width_name;     col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
-        col.pszText = L"Path";          col.cx = app->column_width_path;     col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
-        col.pszText = L"Size";          col.cx = app->column_width_size;     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
-        col.pszText = L"Date Modified"; col.cx = app->column_width_modified; col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
+        col.pszText = L"Name";          col.cx = ui_scale(app->column_width_name);     col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
+        col.pszText = L"Path";          col.cx = ui_scale(app->column_width_path);     col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
+        col.pszText = L"Size";          col.cx = ui_scale(app->column_width_size);     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
+        col.pszText = L"Date Modified"; col.cx = ui_scale(app->column_width_modified); col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
         col.pszText = L"Date Created";  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
         col.pszText = L"Attributes";    col.cx = 0;   col.iSubItem = 5; ListView_InsertColumn(g_hwndList, 5, &col);
         
@@ -2265,7 +2394,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     case WM_THEMECHANGED:
         if (app && app->theme_mode == THEME_SYSTEM)
             ui_apply_theme(hwnd);
-        return 0;
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
     
     case WM_EXITSIZEMOVE:
         ui_apply_layout(hwnd);
@@ -2494,7 +2623,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             
         case IDM_HELP_ABOUT:
             MessageBoxW(hwnd,
-                L"OpenEverything v0.1.9\n\n"
+                L"OpenEverything v" OE_VERSION_WSTRING L"\n\n"
                 L"Everything的开源复刻版本。\n\n"
                 L"原理介绍：\n"
                 L"通过 NTFS USN Journal / MFT 快速建立文件名索引，\n"
@@ -2591,7 +2720,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                     if (di->item.mask & LVIF_TEXT) {
                         switch (di->item.iSubItem) {
                         case COL_NAME:
-                            wcscpy_s(text_buf, 512, e->name ? e->name : L"");
+                            /* Truncate rather than trip the invalid parameter
+                               handler: a name longer than the cell buffer would
+                               otherwise terminate the process mid-paint. */
+                            wcsncpy_s(text_buf, 512, e->name ? e->name : L"",
+                                      _TRUNCATE);
                             di->item.pszText = text_buf;
                             break;
                         case COL_PATH:
@@ -2655,21 +2788,34 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                         wchar_t *name = NULL;
                         wchar_t *path = NULL;
                         int is_directory = 0;
-                        wchar_t msg[1024];
+                        wchar_t prompt[1024];
                         if (!ui_copy_entry_snapshot(app, sel, &name, &path,
                                                     &is_directory))
                             break;
-                        swprintf_s(msg, 1024, L"Delete \"%s\"?", name);
-                        if (MessageBoxW(hwnd, msg, L"Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            if (is_directory) {
-                                /* Recycle bin delete */
+                        _snwprintf_s(prompt, 1024, _TRUNCATE,
+                                     L"Delete \"%s\"?", name);
+                        if (MessageBoxW(hwnd, prompt, L"Delete",
+                                        MB_YESNO | MB_ICONWARNING) == IDYES) {
+                            /* pFrom is a list, not a string: the shell scans
+                               past the first NUL for the list terminator, so a
+                               singly-terminated buffer reads beyond the
+                               allocation -- during a delete, no less. */
+                            size_t path_len = wcslen(path);
+                            wchar_t *op_from =
+                                (wchar_t *)calloc(path_len + 2, sizeof(wchar_t));
+                            if (op_from) {
                                 SHFILEOPSTRUCTW op = {0};
+                                memcpy(op_from, path, path_len * sizeof(wchar_t));
+                                op.hwnd = hwnd;
                                 op.wFunc = FO_DELETE;
-                                op.pFrom = path;
+                                op.pFrom = op_from;
+                                /* Recycle files too. Delete used to unlink them
+                                   outright while sending folders to the bin,
+                                   so the same keystroke was unrecoverable for
+                                   files and undoable for directories. */
                                 op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
                                 SHFileOperationW(&op);
-                            } else {
-                                DeleteFileW(path);
+                                free(op_from);
                             }
                         }
                         free(path);
@@ -2791,6 +2937,27 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     /* ---- User-defined messages ---- */
     case WM_SEARCH_UPDATE:
     {
+        wchar_t *command = (wchar_t *)lParam;
+
+        /* A forwarded command line arrives as a heap string owned by us.
+           Route it through the edit control so the visible text matches the
+           query that actually runs -- ui_start_search reads the box, not
+           app->query.text. EN_CHANGE queues the search. */
+        if (command) {
+            if (g_hwndSearch) {
+                SetWindowTextW(g_hwndSearch, command);
+                SetFocus(g_hwndSearch);
+            }
+            free(command);
+
+            if (IsIconic(hwnd))
+                ShowWindow(hwnd, SW_RESTORE);
+            else
+                ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            return 0;
+        }
+
         ui_queue_search(hwnd);
         return 0;
     }
@@ -2955,10 +3122,28 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     /* ---- Window close/destroy ---- */
     case WM_CLOSE:
         if (g_hwndList) {
-            app->column_width_name = ListView_GetColumnWidth(g_hwndList, 0);
-            app->column_width_path = ListView_GetColumnWidth(g_hwndList, 1);
-            app->column_width_size = ListView_GetColumnWidth(g_hwndList, 2);
-            app->column_width_modified = ListView_GetColumnWidth(g_hwndList, 3);
+            /* Persist in logical units so a later DPI change keeps proportions. */
+            app->column_width_name = ui_unscale(ListView_GetColumnWidth(g_hwndList, 0));
+            app->column_width_path = ui_unscale(ListView_GetColumnWidth(g_hwndList, 1));
+            app->column_width_size = ui_unscale(ListView_GetColumnWidth(g_hwndList, 2));
+            app->column_width_modified = ui_unscale(ListView_GetColumnWidth(g_hwndList, 3));
+        }
+        {
+            /* GetWindowPlacement reports the restored rect even when the window
+               is currently maximized, which is what we want to store. */
+            WINDOWPLACEMENT placement;
+            placement.length = sizeof(placement);
+            if (GetWindowPlacement(hwnd, &placement)) {
+                const RECT *r = &placement.rcNormalPosition;
+                app->window_x = r->left;
+                app->window_y = r->top;
+                app->window_width = ui_unscale(r->right - r->left);
+                app->window_height = ui_unscale(r->bottom - r->top);
+                app->window_maximized =
+                    placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0;
+            }
+            app->sort_column = app->query.sort_column;
+            app->sort_ascending = app->query.sort_ascending;
         }
         config_save(app);
         InterlockedExchange(&app->shutting_down, 1);

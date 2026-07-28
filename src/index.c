@@ -1,14 +1,8 @@
 #include "index.h"
 #include "common.h"
 
-typedef struct {
-    long long file_ref;
-    int volume_index;
-    int index;
-} REF_LOOKUP;
-
-#define REF_INDEX_EMPTY 0ULL
-#define REF_INDEX_TOMBSTONE (~0ULL)
+#define REF_INDEX_EMPTY (-1)
+#define REF_INDEX_TOMBSTONE (-2)
 
 static unsigned long long index_compute_char_mask(const wchar_t *text);
 
@@ -28,19 +22,22 @@ static unsigned int index_ref_hash(unsigned long long key)
     return (unsigned int)key;
 }
 
-static int index_ref_insert_arrays(unsigned long long *keys, int *values,
-                                   int capacity, unsigned long long key, int value)
+static int index_ref_insert_snapshot(int *values, int capacity,
+                                     const unsigned long long *entry_keys,
+                                     int entry_count,
+                                     unsigned long long key, int value)
 {
     unsigned int pos;
     int tombstone = -1;
-    
-    if (!keys || !values || capacity <= 0 || key == REF_INDEX_EMPTY)
+
+    if (!values || !entry_keys || capacity <= 0 ||
+        value < 0 || value >= entry_count)
         return 0;
-    
+
     pos = index_ref_hash(key) & (unsigned int)(capacity - 1);
     for (int probe = 0; probe < capacity; probe++) {
-        unsigned long long current = keys[pos];
-        if (current == key) {
+        int current = values[pos];
+        if (current >= 0 && current < entry_count && entry_keys[current] == key) {
             values[pos] = value;
             return 1;
         }
@@ -49,7 +46,6 @@ static int index_ref_insert_arrays(unsigned long long *keys, int *values,
         if (current == REF_INDEX_EMPTY) {
             if (tombstone >= 0)
                 pos = (unsigned int)tombstone;
-            keys[pos] = key;
             values[pos] = value;
             return 1;
         }
@@ -58,24 +54,58 @@ static int index_ref_insert_arrays(unsigned long long *keys, int *values,
     return 0;
 }
 
-static int index_ref_find_arrays(const unsigned long long *keys, const int *values,
-                                 int capacity, unsigned long long key)
+static int index_ref_find_locked(const APP_STATE *app, unsigned long long key)
 {
     unsigned int pos;
-    
-    if (!keys || !values || capacity <= 0 || key == REF_INDEX_EMPTY)
+
+    if (!app || !app->ref_index_values || app->ref_index_capacity <= 0)
         return -1;
-    
-    pos = index_ref_hash(key) & (unsigned int)(capacity - 1);
-    for (int probe = 0; probe < capacity; probe++) {
-        unsigned long long current = keys[pos];
+
+    pos = index_ref_hash(key) & (unsigned int)(app->ref_index_capacity - 1);
+    for (int probe = 0; probe < app->ref_index_capacity; probe++) {
+        int current = app->ref_index_values[pos];
         if (current == REF_INDEX_EMPTY)
             return -1;
-        if (current == key)
-            return values[pos];
-        pos = (pos + 1) & (unsigned int)(capacity - 1);
+        if (current >= 0 && current < app->entry_count) {
+            const INDEX_ENTRY *entry = &app->entries[current];
+            if (index_ref_key(entry->volume_index, entry->file_ref) == key)
+                return current;
+        }
+        pos = (pos + 1) & (unsigned int)(app->ref_index_capacity - 1);
     }
     return -1;
+}
+
+static int index_ref_insert_locked(APP_STATE *app, unsigned long long key, int value)
+{
+    unsigned int pos;
+    int tombstone = -1;
+
+    if (!app || !app->ref_index_values || app->ref_index_capacity <= 0 ||
+        value < 0 || value >= app->entry_count)
+        return 0;
+
+    pos = index_ref_hash(key) & (unsigned int)(app->ref_index_capacity - 1);
+    for (int probe = 0; probe < app->ref_index_capacity; probe++) {
+        int current = app->ref_index_values[pos];
+        if (current >= 0 && current < app->entry_count) {
+            const INDEX_ENTRY *entry = &app->entries[current];
+            if (index_ref_key(entry->volume_index, entry->file_ref) == key) {
+                app->ref_index_values[pos] = value;
+                return 1;
+            }
+        }
+        if (current == REF_INDEX_TOMBSTONE && tombstone < 0)
+            tombstone = (int)pos;
+        if (current == REF_INDEX_EMPTY) {
+            if (tombstone >= 0)
+                pos = (unsigned int)tombstone;
+            app->ref_index_values[pos] = value;
+            return 1;
+        }
+        pos = (pos + 1) & (unsigned int)(app->ref_index_capacity - 1);
+    }
+    return 0;
 }
 
 static void index_ref_remove_locked(APP_STATE *app, int volume_index, long long file_ref)
@@ -89,13 +119,15 @@ static void index_ref_remove_locked(APP_STATE *app, int volume_index, long long 
     key = index_ref_key(volume_index, file_ref);
     pos = index_ref_hash(key) & (unsigned int)(app->ref_index_capacity - 1);
     for (int probe = 0; probe < app->ref_index_capacity; probe++) {
-        unsigned long long current = app->ref_index_keys[pos];
+        int current = app->ref_index_values[pos];
         if (current == REF_INDEX_EMPTY)
             return;
-        if (current == key) {
-            app->ref_index_keys[pos] = REF_INDEX_TOMBSTONE;
-            app->ref_index_values[pos] = -1;
-            return;
+        if (current >= 0 && current < app->entry_count) {
+            const INDEX_ENTRY *entry = &app->entries[current];
+            if (index_ref_key(entry->volume_index, entry->file_ref) == key) {
+                app->ref_index_values[pos] = REF_INDEX_TOMBSTONE;
+                return;
+            }
         }
         pos = (pos + 1) & (unsigned int)(app->ref_index_capacity - 1);
     }
@@ -116,9 +148,7 @@ static int index_find_parent_locked(APP_STATE *app, int volume_index,
     if (!app || file_ref == 0)
         return -1;
     if (app->ref_index_ready) {
-        return index_ref_find_arrays(app->ref_index_keys, app->ref_index_values,
-                                     app->ref_index_capacity,
-                                     index_ref_key(volume_index, file_ref));
+        return index_ref_find_locked(app, index_ref_key(volume_index, file_ref));
     }
     for (int i = 0; i < app->entry_count; i++) {
         if (app->entries[i].volume_index == volume_index &&
@@ -128,19 +158,40 @@ static int index_find_parent_locked(APP_STATE *app, int volume_index,
     return -1;
 }
 
-wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index)
+/* Resolve an entry's parent row, using the cached hint when it still points at
+   the right file and repairing it when it does not. The hint turns each step of
+   a path walk into an array access; without it every step falls back to
+   index_find_parent_locked, which degrades to a full scan whenever the ref
+   index is not built. The caller must hold index_lock. */
+static int index_resolve_parent_locked(APP_STATE *app, INDEX_ENTRY *entry)
 {
-    int parts[INDEX_MAX_PATH_DEPTH];
+    int hint = entry->parent_index;
+    int found;
+
+    if (hint >= 0 && hint < app->entry_count) {
+        const INDEX_ENTRY *candidate = &app->entries[hint];
+        if (candidate->volume_index == entry->volume_index &&
+            candidate->file_ref == entry->parent_ref)
+            return hint;
+    }
+
+    found = index_find_parent_locked(app, entry->volume_index, entry->parent_ref);
+    entry->parent_index = found;
+    return found;
+}
+
+/* Walk from an entry up to its volume root, recording the rows visited and the
+   drive prefix. Returns the number of parts, or 0 for an invalid entry. */
+static int index_collect_path_parts_locked(APP_STATE *app, int entry_index,
+                                           int *parts, const wchar_t **out_drive)
+{
     int part_count = 0;
     int current = entry_index;
-    const wchar_t *drive = L"";
-    size_t length;
-    wchar_t last_char = L'\0';
-    wchar_t *path;
-    size_t cursor;
+    signed char volume_index;
 
+    *out_drive = L"";
     if (!app || entry_index < 0 || entry_index >= app->entry_count)
-        return NULL;
+        return 0;
 
     while (current >= 0 && current < app->entry_count &&
            part_count < INDEX_MAX_PATH_DEPTH) {
@@ -151,21 +202,37 @@ wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index)
         if (index_entry_is_volume_root(entry) || entry->parent_ref == 0 ||
             entry->parent_ref == entry->file_ref)
             break;
-        parent = index_find_parent_locked(app, entry->volume_index, entry->parent_ref);
+        /* The volume root contributes no path component -- the drive letter
+           already stands in for it, and the write loop skips it anyway. Stop
+           here instead of resolving it: the cache stores no parent row for
+           these, so every path was ending in a full-index scan. */
+        if (entry->parent_ref == NTFS_ROOT_FRN)
+            break;
+        parent = index_resolve_parent_locked(app, entry);
         if (parent < 0 || parent == current)
             break;
         current = parent;
     }
 
-    if (app->entries[entry_index].volume_index >= 0 &&
-        app->entries[entry_index].volume_index < app->volume_count)
-        drive = app->volumes[app->entries[entry_index].volume_index].drive_letter;
-    length = wcslen(drive);
-    if (length > 0)
-        last_char = drive[length - 1];
+    volume_index = app->entries[entry_index].volume_index;
+    if (volume_index >= 0 && volume_index < app->volume_count)
+        *out_drive = app->volumes[volume_index].drive_letter;
+    return part_count;
+}
+
+/* Character count of the joined path, excluding the terminator. Kept in step
+   with the write loop in index_duplicate_entry_path_locked. */
+static size_t index_measure_path_locked(APP_STATE *app, const int *parts,
+                                        int part_count, const wchar_t *drive)
+{
+    size_t length = wcslen(drive);
+    wchar_t last_char = length > 0 ? drive[length - 1] : L'\0';
+
     for (int i = part_count - 1; i >= 0; i--) {
         const INDEX_ENTRY *entry = &app->entries[parts[i]];
         const wchar_t *name;
+        size_t name_len;
+
         if (index_entry_is_volume_root(entry))
             continue;
         name = entry->name ? entry->name : L"";
@@ -173,9 +240,42 @@ wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index)
             continue;
         if (length > 0 && last_char != L'\\' && last_char != L'/')
             length++;
-        length += wcslen(name);
-        last_char = name[wcslen(name) - 1];
+        name_len = wcslen(name);
+        length += name_len;
+        last_char = name[name_len - 1];
     }
+    return length;
+}
+
+/* Measure without building. cache_save_index needs only the length, and
+   materializing a string per entry just to call wcslen on it dominated the
+   save while holding index_lock. */
+size_t index_entry_path_length_locked(APP_STATE *app, int entry_index)
+{
+    int parts[INDEX_MAX_PATH_DEPTH];
+    const wchar_t *drive;
+    int part_count;
+
+    part_count = index_collect_path_parts_locked(app, entry_index, parts, &drive);
+    if (part_count == 0)
+        return 0;
+    return index_measure_path_locked(app, parts, part_count, drive);
+}
+
+wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index)
+{
+    int parts[INDEX_MAX_PATH_DEPTH];
+    const wchar_t *drive;
+    int part_count;
+    size_t length;
+    wchar_t *path;
+    size_t cursor;
+
+    part_count = index_collect_path_parts_locked(app, entry_index, parts, &drive);
+    if (part_count == 0)
+        return NULL;
+
+    length = index_measure_path_locked(app, parts, part_count, drive);
 
     path = (wchar_t *)malloc((length + 1) * sizeof(*path));
     if (!path)
@@ -205,27 +305,6 @@ wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index)
     return path;
 }
 
-static int index_mask_slot(wchar_t ch)
-{
-    if (ch >= L'A' && ch <= L'Z')
-        ch += L'a' - L'A';
-    
-    if (ch >= L'a' && ch <= L'z')
-        return (int)(ch - L'a');
-    if (ch >= L'0' && ch <= L'9')
-        return 26 + (int)(ch - L'0');
-    if (ch == L'_')
-        return 36;
-    if (ch == L'-')
-        return 37;
-    if (ch == L'.')
-        return 38;
-    if (ch == L' ')
-        return 39;
-    
-    return -1;
-}
-
 static wchar_t index_lower_char(wchar_t ch)
 {
     if (ch >= L'A' && ch <= L'Z')
@@ -243,11 +322,11 @@ static unsigned long long index_compute_char_mask(const wchar_t *text)
         return 0;
     
     for (const wchar_t *p = text; *p; p++) {
-        int slot = index_mask_slot(*p);
+        int slot = index_char_mask_slot(*p);
         if (slot >= 0)
             mask |= 1ULL << slot;
     }
-    
+
     return mask;
 }
 
@@ -358,8 +437,6 @@ void index_prepare_entry(INDEX_ENTRY *entry)
     entry->filter_type = (unsigned char)(entry->is_directory
         ? FILTER_FOLDER
         : index_filter_type_for_extension(index_entry_extension(entry)));
-    
-    entry->name_char_mask = index_compute_char_mask(entry->name);
 }
 
 static int index_find_by_ref_locked(APP_STATE *app, int volume_index, long long file_ref)
@@ -404,9 +481,11 @@ static int index_set_entry_from_change(INDEX_ENTRY *entry, const USN_CHANGE *cha
     entry->attributes = change->attributes;
     entry->file_ref = change->file_ref;
     entry->parent_ref = change->parent_ref;
-    entry->is_directory = change->is_directory;
-    entry->volume_index = change->volume_index;
+    entry->is_directory = (unsigned char)(change->is_directory != 0);
+    entry->volume_index = (signed char)change->volume_index;
     entry->metadata_loaded = 0;
+    /* memset left this at 0, which is a valid row; say "unknown" explicitly. */
+    entry->parent_index = INDEX_PARENT_UNKNOWN;
     index_prepare_entry(entry);
     return 1;
 }
@@ -427,6 +506,7 @@ int index_compact_entry_names(APP_STATE *app)
     wchar_t *pool;
     wchar_t *cursor;
     void *old_pool;
+    void *old_cache_view;
     size_t total_chars = 0;
 
     if (!app)
@@ -452,19 +532,24 @@ int index_compact_entry_names(APP_STATE *app)
 
     cursor = pool;
     old_pool = app->entry_string_pool;
+    old_cache_view = app->entry_cache_view;
     for (int i = 0; i < app->entry_count; i++) {
         INDEX_ENTRY *entry = &app->entries[i];
         const wchar_t *name = entry->name ? entry->name : L"";
         size_t chars = wcslen(name) + 1;
         memcpy(cursor, name, chars * sizeof(*cursor));
-        if (!(entry->string_flags & ENTRY_STRING_NAME_POOLED))
+        if (!(entry->string_flags & (ENTRY_STRING_NAME_POOLED |
+                                     ENTRY_STRING_NAME_MAPPED)))
             free(entry->name);
         entry->name = cursor;
-        entry->string_flags |= ENTRY_STRING_NAME_POOLED;
+        entry->string_flags = ENTRY_STRING_NAME_POOLED;
         cursor += chars;
     }
     app->entry_string_pool = pool;
+    app->entry_cache_view = NULL;
     free(old_pool);
+    if (old_cache_view)
+        UnmapViewOfFile(old_cache_view);
     LeaveCriticalSection(&app->index_lock);
     return 1;
 }
@@ -472,7 +557,8 @@ int index_compact_entry_names(APP_STATE *app)
 void index_free_entry(INDEX_ENTRY *entry)
 {
     if (!entry) return;
-    if (!(entry->string_flags & ENTRY_STRING_NAME_POOLED))
+    if (!(entry->string_flags & (ENTRY_STRING_NAME_POOLED |
+                                 ENTRY_STRING_NAME_MAPPED)))
         free(entry->name);
     entry->name = NULL;
     entry->string_flags = 0;
@@ -482,9 +568,7 @@ void index_clear_ref_index(APP_STATE *app)
 {
     if (!app)
         return;
-    free(app->ref_index_keys);
     free(app->ref_index_values);
-    app->ref_index_keys = NULL;
     app->ref_index_values = NULL;
     app->ref_index_capacity = 0;
     app->ref_index_ready = 0;
@@ -492,9 +576,8 @@ void index_clear_ref_index(APP_STATE *app)
 
 int index_build_ref_index(APP_STATE *app)
 {
-    unsigned long long *keys = NULL;
+    unsigned long long *entry_keys = NULL;
     int *values = NULL;
-    REF_LOOKUP *snapshot = NULL;
     int capacity = 1024;
     int ok = 1;
     int entry_count;
@@ -510,38 +593,32 @@ int index_build_ref_index(APP_STATE *app)
 
     while (capacity < entry_count * 2 && capacity < (1 << 30))
         capacity *= 2;
-    snapshot = (REF_LOOKUP *)malloc(
-        (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*snapshot));
-    keys = (unsigned long long *)calloc((size_t)capacity, sizeof(unsigned long long));
+    entry_keys = (unsigned long long *)malloc(
+        (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*entry_keys));
     values = (int *)malloc((size_t)capacity * sizeof(int));
-    if (!snapshot || !keys || !values) {
-        free(snapshot);
-        free(keys);
+    if (!entry_keys || !values) {
+        free(entry_keys);
         free(values);
         return 0;
     }
+    memset(values, 0xff, (size_t)capacity * sizeof(*values));
 
     EnterCriticalSection(&app->index_lock);
     if (app->index_revision != revision || app->entry_count != entry_count) {
         LeaveCriticalSection(&app->index_lock);
-        free(snapshot);
-        free(keys);
+        free(entry_keys);
         free(values);
         return 0;
     }
     for (int i = 0; i < entry_count; i++) {
         INDEX_ENTRY *entry = &app->entries[i];
-        snapshot[i].file_ref = entry->file_ref;
-        snapshot[i].volume_index = entry->volume_index;
-        snapshot[i].index = i;
+        entry_keys[i] = index_ref_key(entry->volume_index, entry->file_ref);
     }
     LeaveCriticalSection(&app->index_lock);
 
     for (int i = 0; i < entry_count; i++) {
-        if (!index_ref_insert_arrays(keys, values, capacity,
-                                     index_ref_key(snapshot[i].volume_index,
-                                                   snapshot[i].file_ref),
-                                     snapshot[i].index)) {
+        if (!index_ref_insert_snapshot(values, capacity, entry_keys,
+                                       entry_count, entry_keys[i], i)) {
             ok = 0;
             break;
         }
@@ -550,18 +627,15 @@ int index_build_ref_index(APP_STATE *app)
     EnterCriticalSection(&app->index_lock);
     if (ok && app->index_revision == revision && app->entry_count == entry_count) {
         index_clear_ref_index(app);
-        app->ref_index_keys = keys;
         app->ref_index_values = values;
         app->ref_index_capacity = capacity;
         app->ref_index_ready = 1;
-        keys = NULL;
         values = NULL;
     } else {
         ok = 0;
     }
     LeaveCriticalSection(&app->index_lock);
-    free(snapshot);
-    free(keys);
+    free(entry_keys);
     free(values);
     return ok;
 }
@@ -603,7 +677,7 @@ int index_build_name_char_index(APP_STATE *app)
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*masks));
     if (masks) {
         for (int i = 0; i < entry_count; i++)
-            masks[i] = app->entries[i].name_char_mask;
+            masks[i] = index_compute_char_mask(app->entries[i].name);
     }
     LeaveCriticalSection(&app->index_lock);
     if (!masks)
@@ -821,6 +895,10 @@ void index_clear(APP_STATE *app)
     app->filtered_stale = 0;
     free(app->entry_string_pool);
     app->entry_string_pool = NULL;
+    if (app->entry_cache_view) {
+        UnmapViewOfFile(app->entry_cache_view);
+        app->entry_cache_view = NULL;
+    }
     InterlockedIncrement(&app->index_revision);
     
     LeaveCriticalSection(&app->index_lock);
@@ -844,9 +922,9 @@ int index_add_entry(APP_STATE *app, INDEX_ENTRY *entry)
     index_clear_name_char_index(app);
     index_clear_filter_index(app);
     if (app->ref_index_ready &&
-        !index_ref_insert_arrays(app->ref_index_keys, app->ref_index_values,
-                                 app->ref_index_capacity,
-                                 index_ref_key(entry->volume_index, entry->file_ref), idx))
+        !index_ref_insert_locked(app,
+                                 index_ref_key(entry->volume_index, entry->file_ref),
+                                 idx))
         index_clear_ref_index(app);
     InterlockedIncrement(&app->index_revision);
     
@@ -947,11 +1025,10 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
                     app->entries[idx] = app->entries[last];
                     moved = &app->entries[idx];
                     if (app->ref_index_ready) {
-                        index_ref_insert_arrays(app->ref_index_keys,
-                                                app->ref_index_values,
-                                                app->ref_index_capacity,
-                                                index_ref_key(moved->volume_index,
-                                                              moved->file_ref), idx);
+                        index_ref_insert_locked(
+                            app,
+                            index_ref_key(moved->volume_index, moved->file_ref),
+                            idx);
                     }
                 }
                 memset(&app->entries[last], 0, sizeof(INDEX_ENTRY));
@@ -1020,11 +1097,10 @@ int index_apply_usn_changes(APP_STATE *app, USN_CHANGE *changes, int count)
                 int new_index = app->entry_count;
                 app->entry_count++;
                 if (app->ref_index_ready &&
-                    !index_ref_insert_arrays(app->ref_index_keys,
-                                             app->ref_index_values,
-                                             app->ref_index_capacity,
-                                             index_ref_key(entry->volume_index,
-                                                           entry->file_ref), new_index)) {
+                    !index_ref_insert_locked(
+                        app,
+                        index_ref_key(entry->volume_index, entry->file_ref),
+                        new_index)) {
                     index_clear_ref_index(app);
                 }
                 applied++;
@@ -1135,7 +1211,16 @@ void index_sort_entries_by_name(APP_STATE *app)
         index_clear_filter_index(app);
         index_clear_ref_index(app);
         qsort(app->entries, app->entry_count, sizeof(INDEX_ENTRY), index_sort_by_name);
+
+        /* Reordering the array invalidates every stored position. Without this
+           the current result set keeps its pre-sort indices and the list shows
+           rows belonging to entirely different files. */
+        app->filtered_count = 0;
+        app->filtered_identity = 0;
+        app->filtered_stale = 1;
+
         InterlockedIncrement(&app->index_revision);
+        InterlockedIncrement(&app->search_generation);
     }
     LeaveCriticalSection(&app->index_lock);
 }

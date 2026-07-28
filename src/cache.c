@@ -6,8 +6,10 @@
 
 #define CACHE_MAGIC_V3 "ECIDX3"
 #define CACHE_MAGIC_V4 "ECIDX4"
+#define CACHE_MAGIC_V5 "ECIDX5"
 #define CACHE_VERSION_V3 3
-#define CACHE_VERSION 4
+#define CACHE_VERSION_V4 4
+#define CACHE_VERSION 5
 #define CACHE_MAX_STRING_LEN 32767U
 #define CACHE_IO_BATCH 2048
 #define CACHE_PARENT_NONE (-1)
@@ -68,6 +70,9 @@ typedef struct {
 } CACHE_ENTRY_V4;
 #pragma pack(pop)
 
+typedef CACHE_HEADER_V4 CACHE_HEADER_V5;
+typedef CACHE_ENTRY_V4 CACHE_ENTRY_V5;
+
 typedef char cache_header_v4_size_must_be_64[
     sizeof(CACHE_HEADER_V4) == 64 ? 1 : -1];
 typedef char cache_entry_v4_size_must_be_70[
@@ -83,6 +88,9 @@ typedef struct {
     VOLUME_INFO volumes[26];
     INDEX_ENTRY *entries;
     wchar_t *string_pool;
+    void *mapped_view;
+    size_t mapped_name_offset;
+    size_t mapped_name_bytes;
     int *filtered;
     int volume_count;
     int entry_count;
@@ -293,6 +301,8 @@ static void cache_discard_load_data(CACHE_LOAD_DATA *data)
         return;
     cache_free_entry_array(data->entries, data->entry_count);
     free(data->string_pool);
+    if (data->mapped_view)
+        UnmapViewOfFile(data->mapped_view);
     free(data->filtered);
     memset(data, 0, sizeof(*data));
 }
@@ -339,15 +349,15 @@ static int cache_index_snapshot_matches(APP_STATE *app, int entry_count,
            app->index_revision == revision;
 }
 
-int cache_save_index(APP_STATE *app)
+int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
 {
     wchar_t path[MAX_PATH];
     wchar_t temp_path[MAX_PATH];
     FILE *f = NULL;
-    CACHE_HEADER_V4 header;
+    CACHE_HEADER_V5 header;
     VOLUME_INFO volumes[26];
     CACHE_REF_LOOKUP *lookup = NULL;
-    CACHE_ENTRY_V4 *record_batch = NULL;
+    CACHE_ENTRY_V5 *record_batch = NULL;
     unsigned short *path_lengths = NULL;
     wchar_t *name_batch = NULL;
     size_t name_batch_capacity = 0;
@@ -359,7 +369,8 @@ int cache_save_index(APP_STATE *app)
     uint64_t written_name_chars = 0;
     int ok = 1;
 
-    if (!app)
+    if (!app || !target_path || !target_path[0] ||
+        wcslen(target_path) >= MAX_PATH - 4)
         return 0;
 
     path[0] = L'\0';
@@ -380,7 +391,7 @@ int cache_save_index(APP_STATE *app)
 
     lookup = (CACHE_REF_LOOKUP *)malloc(
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*lookup));
-    record_batch = (CACHE_ENTRY_V4 *)malloc(
+    record_batch = (CACHE_ENTRY_V5 *)malloc(
         CACHE_IO_BATCH * sizeof(*record_batch));
     path_lengths = (unsigned short *)malloc(
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*path_lengths));
@@ -418,7 +429,6 @@ int cache_save_index(APP_STATE *app)
         } else {
             for (; ok && i < batch_end; i++) {
                 INDEX_ENTRY *entry = &app->entries[i];
-                wchar_t *entry_path;
                 size_t name_len;
                 size_t path_len;
 
@@ -428,22 +438,18 @@ int cache_save_index(APP_STATE *app)
                     break;
                 }
                 name_len = wcslen(entry->name);
-                entry_path = index_duplicate_entry_path_locked(app, i);
-                if (!entry_path) {
-                    ok = 0;
-                    break;
-                }
-                path_len = wcslen(entry_path);
-                free(entry_path);
+                /* Only the length is stored, so measure the path instead of
+                   building and freeing one string per entry under the lock. */
+                path_len = index_entry_path_length_locked(app, i);
                 if (name_len > CACHE_MAX_STRING_LEN ||
                     path_len > CACHE_MAX_STRING_LEN ||
-                    name_chars > UINT64_MAX - name_len ||
+                    name_chars > UINT64_MAX - (name_len + 1) ||
                     path_chars > UINT64_MAX - path_len) {
                     ok = 0;
                     break;
                 }
                 path_lengths[i] = (unsigned short)path_len;
-                name_chars += name_len;
+                name_chars += name_len + 1;
                 path_chars += path_len;
             }
         }
@@ -453,7 +459,7 @@ int cache_save_index(APP_STATE *app)
     if (!ok)
         goto cleanup;
 
-    cache_get_index_path(path, MAX_PATH);
+    wcscpy_s(path, MAX_PATH, target_path);
     if (!cache_ensure_dir(path)) {
         ok = 0;
         goto cleanup;
@@ -467,13 +473,13 @@ int cache_save_index(APP_STATE *app)
     }
 
     memset(&header, 0, sizeof(header));
-    memcpy(header.magic, CACHE_MAGIC_V4, sizeof(CACHE_MAGIC_V4));
+    memcpy(header.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5));
     header.version = CACHE_VERSION;
     header.header_size = sizeof(header);
     header.volume_count = volume_count;
     header.entry_count = entry_count;
     header.volume_record_size = sizeof(VOLUME_INFO);
-    header.entry_record_size = sizeof(CACHE_ENTRY_V4);
+    header.entry_record_size = sizeof(CACHE_ENTRY_V5);
     header.name_chars = name_chars;
     header.path_chars = path_chars;
 
@@ -496,7 +502,7 @@ int cache_save_index(APP_STATE *app)
         } else {
             for (; ok && i < batch_end; i++) {
                 INDEX_ENTRY *entry = &app->entries[i];
-                CACHE_ENTRY_V4 *ce = &record_batch[i - batch_start];
+                CACHE_ENTRY_V5 *ce = &record_batch[i - batch_start];
                 size_t name_len = wcslen(entry->name);
                 size_t path_len = path_lengths[i];
 
@@ -557,11 +563,11 @@ int cache_save_index(APP_STATE *app)
                 size_t name_len = wcslen(entry->name);
 
                 if (name_len > CACHE_MAX_STRING_LEN ||
-                    batch_chars > SIZE_MAX - name_len) {
+                    batch_chars > SIZE_MAX - (name_len + 1)) {
                     ok = 0;
                     break;
                 }
-                batch_chars += name_len;
+                batch_chars += name_len + 1;
             }
         }
         LeaveCriticalSection(&app->index_lock);
@@ -586,10 +592,9 @@ int cache_save_index(APP_STATE *app)
                 for (int n = batch_start; n < batch_end; n++) {
                     INDEX_ENTRY *entry = &app->entries[n];
                     size_t name_len = wcslen(entry->name);
-                    if (name_len > 0) {
-                        memcpy(dst, entry->name, name_len * sizeof(wchar_t));
-                        dst += name_len;
-                    }
+                    memcpy(dst, entry->name,
+                           (name_len + 1) * sizeof(wchar_t));
+                    dst += name_len + 1;
                 }
             }
             LeaveCriticalSection(&app->index_lock);
@@ -633,6 +638,14 @@ cleanup:
         DeleteFileW(temp_path);
 
     return ok;
+}
+
+int cache_save_index(APP_STATE *app)
+{
+    wchar_t path[MAX_PATH];
+
+    cache_get_index_path(path, MAX_PATH);
+    return cache_save_index_to_path(app, path);
 }
 
 static int cache_load_v3_data(const unsigned char *view, size_t file_size,
@@ -711,8 +724,10 @@ static int cache_load_v3_data(const unsigned char *view, size_t file_size,
         entry->attributes = ce.attributes;
         entry->file_ref = ce.file_ref;
         entry->parent_ref = ce.parent_ref;
-        entry->is_directory = ce.is_directory;
-        entry->volume_index = ce.volume_index;
+        entry->is_directory = (unsigned char)(ce.is_directory != 0);
+        entry->volume_index = (signed char)ce.volume_index;
+        /* V3 predates the stored parent row; the hint fills in on first use. */
+        entry->parent_index = INDEX_PARENT_UNKNOWN;
         entry->metadata_loaded =
             (ce.size != 0 || ce.creation_time != 0 || ce.modification_time != 0);
 
@@ -753,7 +768,7 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
     memset(&header, 0, sizeof(header));
     if (!cache_take_bytes(&cursor, end, &header, sizeof(header)) ||
         memcmp(header.magic, CACHE_MAGIC_V4, sizeof(CACHE_MAGIC_V4)) != 0 ||
-        header.version != CACHE_VERSION ||
+        header.version != CACHE_VERSION_V4 ||
         header.header_size != sizeof(CACHE_HEADER_V4) ||
         header.volume_record_size != sizeof(VOLUME_INFO) ||
         header.entry_record_size != sizeof(CACHE_ENTRY_V4) ||
@@ -841,6 +856,10 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
         entry->volume_index = ce.volume_index;
         entry->metadata_loaded =
             (ce.flags & CACHE_ENTRY_FLAG_METADATA_LOADED) != 0;
+        /* The V4 format already stores the parent's row; carrying it into the
+           runtime entry is what makes path rebuilds O(depth) instead of a
+           lookup per level. The loop below verifies every one of these. */
+        entry->parent_index = ce.parent_index;
         entry->name = cache_copy_raw_wstring_to_pool(
             &cursor, end, ce.name_len, &pool_cursor);
         if (!entry->name)
@@ -875,11 +894,193 @@ fail:
     return 0;
 }
 
+static int cache_load_v5_data(const unsigned char *view, size_t file_size,
+                              CACHE_LOAD_DATA *data)
+{
+    const unsigned char *cursor = view;
+    const unsigned char *end = view + file_size;
+    const unsigned char *records;
+    const unsigned char *names;
+    CACHE_HEADER_V5 header;
+    uint64_t name_cursor = 0;
+    uint64_t path_chars = 0;
+    size_t record_bytes;
+    size_t name_bytes;
+
+    memset(&header, 0, sizeof(header));
+    if (!cache_take_bytes(&cursor, end, &header, sizeof(header)) ||
+        memcmp(header.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5)) != 0 ||
+        header.version != CACHE_VERSION ||
+        header.header_size != sizeof(CACHE_HEADER_V5) ||
+        header.volume_record_size != sizeof(VOLUME_INFO) ||
+        header.entry_record_size != sizeof(CACHE_ENTRY_V5) ||
+        header.volume_count < 0 || header.volume_count > 26 ||
+        header.entry_count < 0) {
+        return 0;
+    }
+
+    data->volume_count = header.volume_count;
+    data->entry_count = header.entry_count;
+    data->entry_capacity = cache_load_capacity(header.entry_count);
+    if (header.volume_count > 0) {
+        size_t volume_bytes = sizeof(VOLUME_INFO) * (size_t)header.volume_count;
+        if (!cache_take_bytes(&cursor, end, data->volumes, volume_bytes))
+            return 0;
+    }
+
+    if ((size_t)header.entry_count > SIZE_MAX / sizeof(CACHE_ENTRY_V5))
+        return 0;
+    record_bytes = (size_t)header.entry_count * sizeof(CACHE_ENTRY_V5);
+    if ((size_t)(end - cursor) < record_bytes)
+        return 0;
+    records = cursor;
+    cursor += record_bytes;
+    names = cursor;
+
+    if (header.name_chars > SIZE_MAX / sizeof(wchar_t))
+        return 0;
+    name_bytes = (size_t)header.name_chars * sizeof(wchar_t);
+    if ((size_t)(end - names) != name_bytes)
+        return 0;
+
+    for (int i = 0; i < header.entry_count; i++) {
+        CACHE_ENTRY_V5 ce;
+        const wchar_t *name;
+        uint64_t stored_chars;
+
+        memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
+        stored_chars = (uint64_t)ce.name_len + 1;
+        if (ce.volume_index >= header.volume_count ||
+            ce.name_len > CACHE_MAX_STRING_LEN ||
+            ce.path_len > CACHE_MAX_STRING_LEN ||
+            ce.parent_index < CACHE_PARENT_NONE ||
+            ce.parent_index >= header.entry_count ||
+            ce.parent_index == i ||
+            name_cursor > header.name_chars ||
+            stored_chars > header.name_chars - name_cursor ||
+            path_chars > UINT64_MAX - ce.path_len) {
+            return 0;
+        }
+        name = (const wchar_t *)(names + (size_t)name_cursor * sizeof(wchar_t));
+        if (name[ce.name_len] != L'\0' ||
+            (ce.name_len > 0 && wmemchr(name, L'\0', ce.name_len) != NULL)) {
+            return 0;
+        }
+        name_cursor += stored_chars;
+        path_chars += ce.path_len;
+    }
+    if (name_cursor != header.name_chars || path_chars != header.path_chars)
+        return 0;
+
+    data->entries = (INDEX_ENTRY *)calloc(
+        (size_t)data->entry_capacity, sizeof(INDEX_ENTRY));
+    data->filtered = (int *)calloc(SEARCH_MAX_RESULTS, sizeof(int));
+    if (!data->entries || !data->filtered)
+        goto fail;
+
+    name_cursor = 0;
+    for (int i = 0; i < header.entry_count; i++) {
+        CACHE_ENTRY_V5 ce;
+        INDEX_ENTRY *entry = &data->entries[i];
+
+        memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
+        entry->string_flags = ENTRY_STRING_NAME_MAPPED;
+        entry->size = ce.size;
+        entry->creation_time = ce.creation_time;
+        entry->modification_time = ce.modification_time;
+        entry->attributes = ce.attributes;
+        entry->file_ref = ce.file_ref;
+        entry->parent_ref = ce.parent_ref;
+        entry->is_directory = (ce.flags & CACHE_ENTRY_FLAG_DIRECTORY) != 0;
+        entry->volume_index = ce.volume_index;
+        entry->metadata_loaded =
+            (ce.flags & CACHE_ENTRY_FLAG_METADATA_LOADED) != 0;
+        entry->parent_index = ce.parent_index;
+        entry->name = (wchar_t *)(names +
+            (size_t)name_cursor * sizeof(wchar_t));
+        name_cursor += (uint64_t)ce.name_len + 1;
+    }
+
+    for (int i = 0; i < header.entry_count; i++) {
+        CACHE_ENTRY_V5 ce;
+        INDEX_ENTRY *entry = &data->entries[i];
+        int parent_index;
+
+        memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
+        parent_index = ce.parent_index;
+        if (parent_index >= 0 &&
+            (data->entries[parent_index].volume_index != entry->volume_index ||
+             data->entries[parent_index].file_ref != entry->parent_ref)) {
+            goto fail;
+        }
+    }
+
+    for (int i = 0; i < header.entry_count; i++)
+        index_prepare_entry(&data->entries[i]);
+    data->mapped_name_offset = (size_t)(names - view);
+    data->mapped_name_bytes = name_bytes;
+    return 1;
+
+fail:
+    cache_discard_load_data(data);
+    return 0;
+}
+
+static int cache_remap_v5_names(HANDLE mapping, const unsigned char *full_view,
+                                CACHE_LOAD_DATA *data)
+{
+    SYSTEM_INFO system_info;
+    uint64_t name_offset;
+    uint64_t aligned_offset;
+    size_t delta;
+    size_t view_bytes;
+    unsigned char *name_view;
+    unsigned char *name_base;
+    const unsigned char *old_name_base;
+
+    if (!mapping || !full_view || !data)
+        return 0;
+    if (data->mapped_name_bytes == 0)
+        return data->entry_count == 0;
+
+    GetSystemInfo(&system_info);
+    if (system_info.dwAllocationGranularity == 0)
+        return 0;
+    name_offset = data->mapped_name_offset;
+    aligned_offset = name_offset -
+        (name_offset % system_info.dwAllocationGranularity);
+    delta = (size_t)(name_offset - aligned_offset);
+    if (data->mapped_name_bytes > SIZE_MAX - delta)
+        return 0;
+    view_bytes = delta + data->mapped_name_bytes;
+
+    name_view = (unsigned char *)MapViewOfFile(
+        mapping, FILE_MAP_READ,
+        (DWORD)(aligned_offset >> 32), (DWORD)aligned_offset, view_bytes);
+    if (!name_view)
+        return 0;
+
+    name_base = name_view + delta;
+    old_name_base = full_view + data->mapped_name_offset;
+    for (int i = 0; i < data->entry_count; i++) {
+        INDEX_ENTRY *entry = &data->entries[i];
+        size_t relative = (size_t)((const unsigned char *)entry->name - old_name_base);
+        if (relative >= data->mapped_name_bytes) {
+            UnmapViewOfFile(name_view);
+            return 0;
+        }
+        entry->name = (wchar_t *)(name_base + relative);
+    }
+    data->mapped_view = name_view;
+    return 1;
+}
+
 static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
 {
     INDEX_ENTRY *old_entries;
     int *old_filtered;
     void *old_string_pool;
+    void *old_mapped_view;
     int old_entry_count;
 
     EnterCriticalSection(&app->index_lock);
@@ -887,6 +1088,7 @@ static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
     old_entry_count = app->entry_count;
     old_filtered = app->filtered_indices;
     old_string_pool = app->entry_string_pool;
+    old_mapped_view = app->entry_cache_view;
     index_clear_name_char_index(app);
     index_clear_filter_index(app);
     index_clear_ref_index(app);
@@ -896,6 +1098,7 @@ static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
     app->entry_capacity = data->entry_capacity;
     app->filtered_indices = data->filtered;
     app->entry_string_pool = data->string_pool;
+    app->entry_cache_view = data->mapped_view;
     app->filtered_count = 0;
     app->filtered_identity = 0;
     app->filtered_stale = 0;
@@ -912,14 +1115,16 @@ static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
     data->entries = NULL;
     data->filtered = NULL;
     data->string_pool = NULL;
+    data->mapped_view = NULL;
     cache_free_entry_array(old_entries, old_entry_count);
     free(old_string_pool);
+    if (old_mapped_view)
+        UnmapViewOfFile(old_mapped_view);
     free(old_filtered);
 }
 
-int cache_load_index(APP_STATE *app)
+int cache_load_index_from_path(APP_STATE *app, const wchar_t *path)
 {
-    wchar_t path[MAX_PATH];
     HANDLE hFile = INVALID_HANDLE_VALUE;
     HANDLE hMap = NULL;
     unsigned char *view = NULL;
@@ -928,13 +1133,11 @@ int cache_load_index(APP_STATE *app)
     CACHE_LOAD_DATA data;
     int result = CACHE_LOAD_FAILED;
 
-    if (!app)
+    if (!app || !path || !path[0])
         return CACHE_LOAD_FAILED;
 
     memset(&data, 0, sizeof(data));
     memset(&prefix, 0, sizeof(prefix));
-    cache_get_index_path(path, MAX_PATH);
-
     hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                         NULL, OPEN_EXISTING,
                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -966,12 +1169,19 @@ int cache_load_index(APP_STATE *app)
         if (cache_load_v3_data(view, (size_t)file_size.QuadPart, &data))
             result = CACHE_LOAD_LEGACY;
     } else if (memcmp(prefix.magic, CACHE_MAGIC_V4, sizeof(CACHE_MAGIC_V4)) == 0 &&
-               prefix.version == CACHE_VERSION) {
+               prefix.version == CACHE_VERSION_V4) {
         if (cache_load_v4_data(view, (size_t)file_size.QuadPart, &data))
+            result = CACHE_LOAD_LEGACY;
+    } else if (memcmp(prefix.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5)) == 0 &&
+               prefix.version == CACHE_VERSION) {
+        if (cache_load_v5_data(view, (size_t)file_size.QuadPart, &data) &&
+            cache_remap_v5_names(hMap, view, &data)) {
             result = CACHE_LOAD_CURRENT;
+        }
     }
 
-    UnmapViewOfFile(view);
+    if (view)
+        UnmapViewOfFile(view);
     CloseHandle(hMap);
     CloseHandle(hFile);
 
@@ -982,4 +1192,12 @@ int cache_load_index(APP_STATE *app)
 
     cache_install_load_data(app, &data);
     return result;
+}
+
+int cache_load_index(APP_STATE *app)
+{
+    wchar_t path[MAX_PATH];
+
+    cache_get_index_path(path, MAX_PATH);
+    return cache_load_index_from_path(app, path);
 }

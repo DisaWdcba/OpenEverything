@@ -75,13 +75,21 @@
 #define FR_IN_USE                        0x0001
 #define FR_DIRECTORY                     0x0002
 
+/* MFT record 5 is the NTFS volume root directory. */
+#define NTFS_ROOT_FRN                    5
+
 /* Search types */
 #define SEARCH_MAX_RESULTS               100000
+/* Slots 0..SEARCH_CHAR_SLOT_COUNT-1 are also backed by the inverted name
+   index. The temporary build mask is 64 bits wide, so the remaining slots
+   exist only as filter bits -- see index_char_mask_slot. */
 #define SEARCH_CHAR_SLOT_COUNT           40
+#define SEARCH_MASK_EXTRA_SLOTS          24
 #define SEARCH_FOLDER_SCOPE_MAX          1024
 
 /* Entry string ownership flags */
 #define ENTRY_STRING_NAME_POOLED         0x01
+#define ENTRY_STRING_NAME_MAPPED         0x02
 
 /* UI constants */
 #define WC_EVERYTHING                    L"OPENEVERYTHING"
@@ -250,6 +258,36 @@ typedef struct {
     /* wchar_t Name[NameLength] follows after this header */
 } FILE_NAME_ATTR;
 
+/* Map a character to a bit position in the temporary name-character mask.
+ *
+ * The indexer (building an entry's mask) and the search (building the query's
+ * mask) MUST agree on this mapping exactly -- a mismatch makes the bloom test
+ * `(entry_mask & query_mask) != query_mask` reject entries that actually match.
+ * They used to keep private, subtly different copies, so it lives here as the
+ * single definition.
+ *
+ * Non-ASCII folds into the high slots that the inverted index does not use.
+ * Previously such characters returned -1, which left char_mask empty for CJK
+ * queries and turned every one of them into an unfiltered full scan.
+ */
+static inline int index_char_mask_slot(wchar_t ch) {
+    if (ch >= L'A' && ch <= L'Z')
+        ch = (wchar_t)(ch + (L'a' - L'A'));
+
+    if (ch >= L'a' && ch <= L'z') return (int)(ch - L'a');
+    if (ch >= L'0' && ch <= L'9') return 26 + (int)(ch - L'0');
+    if (ch == L'_') return 36;
+    if (ch == L'-') return 37;
+    if (ch == L'.') return 38;
+    if (ch == L' ') return 39;
+    if (ch >= 128) {
+        wchar_t folded = (wchar_t)towlower(ch);
+        return SEARCH_CHAR_SLOT_COUNT +
+               (int)((unsigned int)folded % SEARCH_MASK_EXTRA_SLOTS);
+    }
+    return -1;
+}
+
 /* Convert 6-byte MFT reference to 64-bit FRN */
 static inline long long mft_ref_to_frn(unsigned int low, unsigned short high) {
     return (long long)(((unsigned long long)high << 32) | low) & 0x0000FFFFFFFFFFFFLL;
@@ -332,14 +370,21 @@ typedef struct {
 
 #pragma pack(pop)
 
-/* Index entry structure */
+/* Index entry structure.
+ *
+ * parent_index sits in the 4-byte hole the compiler already inserted after
+ * `attributes`, so caching the parent's array position costs no extra memory.
+ * It is a hint, not a fact: the swap-remove in index_apply_usn_changes moves
+ * entries around, so it is verified against the parent's file_ref on use and
+ * repaired on a miss (see index_resolve_parent_locked). -1 means "unknown".
+ */
 typedef struct {
     wchar_t *name;
-    unsigned long long name_char_mask;
     long long size;
     long long creation_time;
     long long modification_time;
     unsigned int attributes;
+    int parent_index;
     long long file_ref;
     long long parent_ref;
     unsigned char string_flags;
@@ -349,6 +394,8 @@ typedef struct {
     unsigned char metadata_loaded;
     unsigned char metadata_queued;
 } INDEX_ENTRY;
+
+#define INDEX_PARENT_UNKNOWN (-1)
 
 typedef struct {
     wchar_t *name;
@@ -376,12 +423,21 @@ typedef struct {
     long long usn_lowest_valid_usn;
 } VOLUME_INFO;
 
-/* Search query */
+/* Search query.
+ *
+ * The three `*_offset`/`has_*` fields below are derived from `text` once in
+ * search_prepare_query. They used to be recomputed with wcsstr/wcschr inside
+ * search_match_entry, i.e. four scans of the query string per indexed file.
+ * Offsets rather than pointers so the struct stays safe to copy by value.
+ */
 typedef struct {
     wchar_t text[512];
     wchar_t folded_text[512];
     int text_len;
     int folded_ready;
+    int ext_filter_offset;   /* index just past "ext:", or -1 */
+    int has_folder_filter;
+    int has_wildcard;
     unsigned long long char_mask;
     int match_case;
     int match_whole_word;
@@ -419,12 +475,12 @@ typedef struct {
     int *filter_indices[FILTER_COUNT];
     int filter_counts[FILTER_COUNT];
     int filter_index_ready;
-    unsigned long long *ref_index_keys;
     int *ref_index_values;
     int ref_index_capacity;
     int ref_index_ready;
     volatile LONG index_revision;
     void *entry_string_pool;
+    void *entry_cache_view;
     int cache_loaded;
     CRITICAL_SECTION index_lock;
     
@@ -470,6 +526,17 @@ typedef struct {
     int selected_filter;
     int include_subfolders;
     wchar_t folder_scope[SEARCH_FOLDER_SCOPE_MAX];
+
+    /* Window placement. Position is in physical screen pixels (it addresses a
+       specific monitor); size is in 96-DPI logical units so it stays sensible
+       across displays. window_width == 0 means "nothing saved yet". */
+    int window_x;
+    int window_y;
+    int window_width;
+    int window_height;
+    int window_maximized;
+    int sort_column;
+    int sort_ascending;
 } APP_STATE;
 
 extern APP_STATE g_app;

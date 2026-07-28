@@ -26,7 +26,8 @@ int index_sort_by_date_created(const void *a, const void *b);
 int index_sort_by_attributes(const void *a, const void *b);
 void index_free_entry(INDEX_ENTRY *entry);
 const wchar_t *index_entry_extension(const INDEX_ENTRY *entry);
-/* The caller must hold app->index_lock while using this helper. */
+/* The caller must hold app->index_lock while using these helpers. */
 wchar_t *index_duplicate_entry_path_locked(APP_STATE *app, int entry_index);
+size_t index_entry_path_length_locked(APP_STATE *app, int entry_index);
 
 #endif /* INDEX_H */

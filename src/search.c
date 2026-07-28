@@ -64,26 +64,6 @@ static int search_matches_folder(const wchar_t *path, const SEARCH_QUERY *query)
            _wcsnicmp(path, query->folder_scope, scope_len) == 0;
 }
 
-static int search_mask_slot(wchar_t ch)
-{
-    ch = search_lower_char(ch);
-    
-    if (ch >= L'a' && ch <= L'z')
-        return (int)(ch - L'a');
-    if (ch >= L'0' && ch <= L'9')
-        return 26 + (int)(ch - L'0');
-    if (ch == L'_')
-        return 36;
-    if (ch == L'-')
-        return 37;
-    if (ch == L'.')
-        return 38;
-    if (ch == L' ')
-        return 39;
-    
-    return -1;
-}
-
 static int search_query_has_plain_name_fast_path(const SEARCH_QUERY *query)
 {
     if (!query || !query->text[0])
@@ -199,26 +179,36 @@ static int search_contains_pre_folded(const wchar_t *folded_text, const wchar_t 
 
 void search_prepare_query(SEARCH_QUERY *query)
 {
+    const wchar_t *ext;
     int i;
-    
+
     if (!query)
         return;
-    
+
     query->text_len = (int)wcslen(query->text);
     if (query->text_len > 511)
         query->text_len = 511;
-    
+
     for (i = 0; i < query->text_len; i++)
         query->folded_text[i] = search_lower_char(query->text[i]);
     query->folded_text[i] = L'\0';
     query->folded_ready = 1;
-    
+
     query->char_mask = 0;
     for (i = 0; i < query->text_len; i++) {
-        int slot = search_mask_slot(query->text[i]);
+        int slot = index_char_mask_slot(query->text[i]);
         if (slot >= 0)
             query->char_mask |= 1ULL << slot;
     }
+
+    /* Hoisted out of search_match_entry, which ran these scans once per
+       indexed file. Case-sensitive wcsstr preserves the previous matching
+       behaviour for the "ext:"/"folder:" prefixes. */
+    ext = wcsstr(query->text, L"ext:");
+    query->ext_filter_offset = ext ? (int)(ext - query->text) + 4 : -1;
+    query->has_folder_filter = wcsstr(query->text, L"folder:") != NULL;
+    query->has_wildcard = wcschr(query->text, L'*') != NULL ||
+                          wcschr(query->text, L'?') != NULL;
 }
 
 static int compare_entries_for_query(APP_STATE *app, int ia, int ib, int column)
@@ -391,16 +381,17 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
     if (!target) goto done;
     
     /* Handle special type filters */
-    if (wcsstr(query->text, L"ext:")) {
-        /* Extension filter */
-        const wchar_t *exts = wcsstr(query->text, L"ext:") + 4;
+    if (query->ext_filter_offset >= 0) {
+        const wchar_t *exts = query->text + query->ext_filter_offset;
+        const wchar_t *entry_ext = index_entry_extension(entry);
         wchar_t exts_copy[512];
-        wcscpy_s(exts_copy, 512, exts);
-        
+
+        wcsncpy_s(exts_copy, 512, exts, _TRUNCATE);
+
         wchar_t *ctx = NULL;
         wchar_t *ext = wcstok_s(exts_copy, L";", &ctx);
         while (ext) {
-            if (_wcsicmp(index_entry_extension(entry), ext) == 0) {
+            if (_wcsicmp(entry_ext, ext) == 0) {
                 matched = 1;
                 goto done;
             }
@@ -408,16 +399,10 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
         }
         goto done;
     }
-    
-    if (wcsstr(query->text, L"folder:")) {
+
+    if (query->has_folder_filter) {
         matched = entry->is_directory ? 1 : 0;
         goto done;
-    }
-    
-    if (query->char_mask) {
-        if (!query->match_path &&
-            (entry->name_char_mask & query->char_mask) != query->char_mask)
-            goto done;
     }
     
     /* Regular matching */
@@ -426,7 +411,7 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
         goto done;
     }
     
-    if (!wcschr(query->text, L'*') && !wcschr(query->text, L'?')) {
+    if (!query->has_wildcard) {
         matched = query->match_case
             ? (wcsstr(target, query->text) != NULL)
             : (query->folded_ready
@@ -434,16 +419,29 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
                 : search_contains_ignore_case(target, query->text));
         goto done;
     }
-    
-    /* Wildcard match - wrap with * if no wildcards */
-    wchar_t pattern[512];
-    wcscpy_s(pattern, 512, query->text);
-    
-    matched = match_wildcard(target, pattern, query->match_case);
+
+    /* match_wildcard does not modify the pattern, so pass it straight through;
+       the old code copied 1 KB onto the stack for every candidate entry. */
+    matched = match_wildcard(target, query->text, query->match_case);
 
 done:
     free(path);
     return matched;
+}
+
+/* Drop indices that no longer address a live entry, preserving order.
+   The caller must hold index_lock. A USN delete can shrink the index between
+   the collect phase and the sort phase, and the sort comparator dereferences
+   app->entries directly. */
+static int search_clamp_indices(APP_STATE *app, int *indices, int count)
+{
+    int valid = 0;
+
+    for (int n = 0; n < count; n++) {
+        if (indices[n] >= 0 && indices[n] < app->entry_count)
+            indices[valid++] = indices[n];
+    }
+    return valid;
 }
 
 void search_sort_results(APP_STATE *app)
@@ -451,17 +449,75 @@ void search_sort_results(APP_STATE *app)
     search_sort_indices(app, &app->query, app->filtered_indices, app->filtered_count);
 }
 
+typedef struct {
+    int index;
+    wchar_t *path;
+} PATH_SORT_ITEM;
+
+static int compare_path_items(void *ctx, const void *lhs, const void *rhs)
+{
+    SORT_CONTEXT *sort = (SORT_CONTEXT *)ctx;
+    const PATH_SORT_ITEM *a = (const PATH_SORT_ITEM *)lhs;
+    const PATH_SORT_ITEM *b = (const PATH_SORT_ITEM *)rhs;
+    const INDEX_ENTRY *ea = &sort->app->entries[a->index];
+    const INDEX_ENTRY *eb = &sort->app->entries[b->index];
+    int result;
+
+    if (ea->is_directory != eb->is_directory)
+        return ea->is_directory ? -1 : 1;
+
+    result = _wcsicmp(a->path ? a->path : L"", b->path ? b->path : L"");
+    if (result == 0)
+        result = compare_int64(ea->file_ref, eb->file_ref);
+
+    return sort->query->sort_ascending ? result : -result;
+}
+
+/* Sorting by path needs every entry's full path. Building them once is O(n)
+   rebuilds; the generic comparator rebuilt two paths (with two heap
+   allocations) on every one of the O(n log n) comparisons. Returns 0 if the
+   temporary cannot be allocated, leaving the caller to use the slow path. */
+static int search_sort_by_path(APP_STATE *app, const SEARCH_QUERY *query,
+                               int *indices, int count)
+{
+    PATH_SORT_ITEM *items;
+    SORT_CONTEXT ctx;
+
+    items = (PATH_SORT_ITEM *)malloc((size_t)count * sizeof(*items));
+    if (!items)
+        return 0;
+
+    for (int i = 0; i < count; i++) {
+        items[i].index = indices[i];
+        items[i].path = index_duplicate_entry_path_locked(app, indices[i]);
+    }
+
+    ctx.app = app;
+    ctx.query = query;
+    qsort_s(items, (size_t)count, sizeof(*items), compare_path_items, &ctx);
+
+    for (int i = 0; i < count; i++) {
+        indices[i] = items[i].index;
+        free(items[i].path);
+    }
+    free(items);
+    return 1;
+}
+
 void search_sort_indices(APP_STATE *app, const SEARCH_QUERY *query, int *indices, int count)
 {
     SORT_CONTEXT ctx;
-    
+
     if (count <= 1)
         return;
-    
+
     ctx.app = app;
     ctx.query = query;
     if (query->sort_column == COL_NAME && query->sort_ascending &&
         search_sort_nearly_ordered(indices, count, &ctx))
+        return;
+    if (query->sort_column == COL_PATH &&
+        search_sort_by_path(app, query, indices, count))
         return;
     qsort_s(indices, count, sizeof(int), compare_filtered_indices_ctx, &ctx);
 }
@@ -545,8 +601,12 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
                         out_indices[right] = swap;
                     }
                 }
+                EnterCriticalSection(&app->index_lock);
+                count = search_clamp_indices(app, out_indices, count);
+                LeaveCriticalSection(&app->index_lock);
             } else if (generation == app->search_generation) {
                 EnterCriticalSection(&app->index_lock);
+                count = search_clamp_indices(app, out_indices, count);
                 search_sort_indices(app, query, out_indices, count);
                 LeaveCriticalSection(&app->index_lock);
             }
@@ -571,6 +631,11 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
         if (generation != app->search_generation)
             return count;
         EnterCriticalSection(&app->index_lock);
+        /* out_indices is the identity map built outside the lock; if the index
+           shrank meanwhile, clamping the count is enough to keep every
+           remaining index valid. */
+        if (count > app->entry_count)
+            count = app->entry_count;
         search_sort_indices(app, query, out_indices, count);
         LeaveCriticalSection(&app->index_lock);
         return count;
@@ -714,20 +779,10 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
     if (generation != app->search_generation)
         return count;
     
-    {
-        int valid_count = 0;
-        int entry_count;
-        
-        EnterCriticalSection(&app->index_lock);
-        entry_count = app->entry_count;
-        for (int n = 0; n < count; n++) {
-            if (out_indices[n] >= 0 && out_indices[n] < entry_count)
-                out_indices[valid_count++] = out_indices[n];
-        }
-        count = valid_count;
-        search_sort_indices(app, query, out_indices, count);
-        LeaveCriticalSection(&app->index_lock);
-    }
+    EnterCriticalSection(&app->index_lock);
+    count = search_clamp_indices(app, out_indices, count);
+    search_sort_indices(app, query, out_indices, count);
+    LeaveCriticalSection(&app->index_lock);
     return count;
 }
 

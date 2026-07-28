@@ -3,10 +3,17 @@
 void config_get_path(wchar_t *buf, size_t size)
 {
     wchar_t appdata[MAX_PATH];
+
+    if (!buf || size == 0)
+        return;
+
+    /* _snwprintf_s truncates; swprintf_s would invoke the invalid parameter
+       handler and kill the process when LOCALAPPDATA is long enough that the
+       joined path overflows the caller's MAX_PATH buffer. */
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata))) {
-        swprintf_s(buf, size, L"%s\\OpenEverything\\config.ini", appdata);
+        _snwprintf_s(buf, size, _TRUNCATE, L"%s\\OpenEverything\\config.ini", appdata);
     } else {
-        wcscpy_s(buf, size, L"config.ini");
+        wcsncpy_s(buf, size, L"config.ini", _TRUNCATE);
     }
 }
 
@@ -14,6 +21,21 @@ static int config_read_int(const wchar_t *path, const wchar_t *section,
                             const wchar_t *key, int default_val)
 {
     return GetPrivateProfileIntW(section, key, default_val, path);
+}
+
+/* GetPrivateProfileIntW returns 0 for any value below zero, which would erase
+   window coordinates on monitors left of or above the primary one. Parse the
+   raw string instead. */
+static int config_read_int_signed(const wchar_t *path, const wchar_t *section,
+                                  const wchar_t *key, int default_val)
+{
+    wchar_t buf[32];
+    wchar_t fallback[32];
+
+    _snwprintf_s(fallback, 32, _TRUNCATE, L"%d", default_val);
+    if (GetPrivateProfileStringW(section, key, fallback, buf, 32, path) == 0)
+        return default_val;
+    return _wtoi(buf);
 }
 
 static void config_write_int(const wchar_t *path, const wchar_t *section,
@@ -88,7 +110,24 @@ void config_load(APP_STATE *app)
             ? PANEL_DOCK_RIGHT : PANEL_DOCK_LEFT;
     if (app->selected_filter < FILTER_EVERYTHING || app->selected_filter >= FILTER_COUNT)
         app->selected_filter = FILTER_EVERYTHING;
-    
+
+    app->window_x = config_read_int_signed(path, L"Window", L"X", 0);
+    app->window_y = config_read_int_signed(path, L"Window", L"Y", 0);
+    app->window_width = config_read_int(path, L"Window", L"Width", 0);
+    app->window_height = config_read_int(path, L"Window", L"Height", 0);
+    app->window_maximized = config_read_int(path, L"Window", L"Maximized", 0) != 0;
+    /* Treat an implausible size as "not saved" and fall back to the default. */
+    if (app->window_width < 400 || app->window_height < 300 ||
+        app->window_width > 30000 || app->window_height > 30000) {
+        app->window_width = 0;
+        app->window_height = 0;
+    }
+
+    app->sort_column = config_read_int(path, L"View", L"SortColumn", COL_NAME);
+    app->sort_ascending = config_read_int(path, L"View", L"SortAscending", 1) != 0;
+    if (app->sort_column < COL_NAME || app->sort_column > COL_ATTRIBUTES)
+        app->sort_column = COL_NAME;
+
     /* Apply to query */
     app->query.match_case = app->match_case;
     app->query.match_whole_word = app->match_whole_word;
@@ -97,8 +136,8 @@ void config_load(APP_STATE *app)
     app->query.filter_id = app->selected_filter;
     app->query.include_subfolders = app->include_subfolders;
     app->query.folder_scope[0] = L'\0';
-    app->query.sort_column = COL_NAME;
-    app->query.sort_ascending = 1;
+    app->query.sort_column = app->sort_column;
+    app->query.sort_ascending = app->sort_ascending;
 }
 
 void config_save(APP_STATE *app)
@@ -127,4 +166,14 @@ void config_save(APP_STATE *app)
     config_write_int(path, L"View", L"FiltersSide", app->filter_panel_side);
     config_write_int(path, L"View", L"Filter", app->selected_filter);
     config_write_int(path, L"View", L"Subfolders", app->include_subfolders);
+    config_write_int(path, L"View", L"SortColumn", app->sort_column);
+    config_write_int(path, L"View", L"SortAscending", app->sort_ascending);
+
+    if (app->window_width > 0 && app->window_height > 0) {
+        config_write_int(path, L"Window", L"X", app->window_x);
+        config_write_int(path, L"Window", L"Y", app->window_y);
+        config_write_int(path, L"Window", L"Width", app->window_width);
+        config_write_int(path, L"Window", L"Height", app->window_height);
+        config_write_int(path, L"Window", L"Maximized", app->window_maximized);
+    }
 }

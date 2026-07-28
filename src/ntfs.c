@@ -79,37 +79,81 @@ static long long ntfs_ref_to_frn(long long ref)
     return ref & 0x0000FFFFFFFFFFFFLL;
 }
 
+/* A single NTFS name component tops out at 255 characters. Enforcing it here
+   keeps every downstream fixed buffer (notably the 512-char ListView cell)
+   within range no matter what the journal hands us. */
+#define NTFS_MAX_NAME_CHARS 255
+
+/* Resolve a USN record's name and prove it lies inside the record. The kernel
+   is the producer, but an out-of-range FileNameOffset would otherwise read
+   past the IOCTL buffer, so bound it explicitly. */
+static int ntfs_usn_record_name(const USN_RECORD_BUF *rec, unsigned int record_bytes,
+                                const wchar_t **out_name, int *out_chars)
+{
+    unsigned int name_offset;
+    unsigned int name_bytes;
+    unsigned int chars;
+
+    if (!rec || rec->MajorVersion != 2)
+        return 0;
+
+    name_offset = rec->FileNameOffset;
+    name_bytes = rec->FileNameLength;
+
+    if (name_bytes == 0 || (name_bytes % sizeof(wchar_t)) != 0)
+        return 0;
+    if (name_offset < sizeof(USN_RECORD_BUF) || name_offset > record_bytes)
+        return 0;
+    if (name_bytes > record_bytes - name_offset)
+        return 0;
+
+    chars = name_bytes / sizeof(wchar_t);
+    if (chars == 0 || chars > NTFS_MAX_NAME_CHARS)
+        return 0;
+
+    *out_name = (const wchar_t *)((const char *)rec + name_offset);
+    *out_chars = (int)chars;
+    return 1;
+}
+
 static int ntfs_grow_entries(INDEX_ENTRY **entries, int *capacity, int needed)
 {
     if (needed <= *capacity)
         return 1;
-    
-    int new_cap = *capacity;
-    while (new_cap < needed)
+    if (needed > (int)(INT_MAX / sizeof(INDEX_ENTRY)))
+        return 0;
+
+    /* A zero capacity would spin forever on the doubling loop below. */
+    int new_cap = *capacity > 0 ? *capacity : 65536;
+    while (new_cap < needed) {
+        if (new_cap > INT_MAX / 2)
+            return 0;
         new_cap *= 2;
-    
-    INDEX_ENTRY *new_entries = (INDEX_ENTRY *)realloc(*entries, new_cap * sizeof(INDEX_ENTRY));
+    }
+
+    INDEX_ENTRY *new_entries = (INDEX_ENTRY *)realloc(*entries, (size_t)new_cap * sizeof(INDEX_ENTRY));
     if (!new_entries)
         return 0;
-    
-    memset(new_entries + *capacity, 0, (new_cap - *capacity) * sizeof(INDEX_ENTRY));
+
+    memset(new_entries + *capacity, 0, (size_t)(new_cap - *capacity) * sizeof(INDEX_ENTRY));
     *entries = new_entries;
     *capacity = new_cap;
     return 1;
 }
 
-static void ntfs_fill_entry_from_name(INDEX_ENTRY *e, const wchar_t *name, int name_len)
+static int ntfs_fill_entry_from_name(INDEX_ENTRY *e, const wchar_t *name, int name_len)
 {
     if (name_len < 0)
         name_len = (int)wcslen(name);
-    
+
     e->name = (wchar_t *)malloc(((size_t)name_len + 1) * sizeof(wchar_t));
-    if (e->name) {
-        if (name_len > 0)
-            memcpy(e->name, name, (size_t)name_len * sizeof(wchar_t));
-        e->name[name_len] = L'\0';
-    }
-    
+    if (!e->name)
+        return 0;
+
+    if (name_len > 0)
+        memcpy(e->name, name, (size_t)name_len * sizeof(wchar_t));
+    e->name[name_len] = L'\0';
+    return 1;
 }
 
 int ntfs_update_volume_usn_info(HANDLE hVolume, VOLUME_INFO *volume)
@@ -136,8 +180,9 @@ int ntfs_read_usn_index(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_coun
     INDEX_ENTRY *entries = NULL;
     int entry_count = 0;
     int entry_cap = 65536;
+    int last_progress = 0;
     int ok = 0;
-    
+
     *out_entries = NULL;
     *out_count = 0;
     
@@ -181,36 +226,47 @@ int ntfs_read_usn_index(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_coun
         DWORD offset = sizeof(long long);
         while (offset + sizeof(USN_RECORD_BUF) <= bytes) {
             USN_RECORD_BUF *rec = (USN_RECORD_BUF *)(buffer + offset);
-            if (rec->RecordLength == 0 || offset + rec->RecordLength > bytes)
+            const wchar_t *name;
+            int name_chars;
+
+            if (rec->RecordLength < sizeof(USN_RECORD_BUF) ||
+                offset + rec->RecordLength > bytes)
                 break;
-            
-            if (rec->MajorVersion == 2 && rec->FileNameLength > 0) {
-                int name_chars = rec->FileNameLength / sizeof(wchar_t);
-                wchar_t *name = (wchar_t *)((char *)rec + rec->FileNameOffset);
-                
-                if (name_chars > 0 && name_chars < 32767 &&
-                    ntfs_grow_entries(&entries, &entry_cap, entry_count + 1)) {
-                    INDEX_ENTRY *e = &entries[entry_count];
-                    ntfs_fill_entry_from_name(e, name, name_chars);
-                    e->size = 0;
-                    e->creation_time = 0;
-                    e->modification_time = 0;
-                    e->attributes = rec->FileAttributes;
-                    e->file_ref = ntfs_ref_to_frn(rec->FileReferenceNumber);
-                    e->parent_ref = ntfs_ref_to_frn(rec->ParentFileReferenceNumber);
-                    e->is_directory = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-                    e->volume_index = volume_index;
-                    entry_count++;
-                }
+
+            if (ntfs_usn_record_name(rec, rec->RecordLength, &name, &name_chars) &&
+                ntfs_grow_entries(&entries, &entry_cap, entry_count + 1)) {
+                INDEX_ENTRY *e = &entries[entry_count];
+
+                /* Publish only once the name is owned. A NULL name here would
+                   travel into the index and make every later cache save fail. */
+                if (!ntfs_fill_entry_from_name(e, name, name_chars))
+                    goto enum_done;
+
+                e->size = 0;
+                e->creation_time = 0;
+                e->modification_time = 0;
+                e->attributes = rec->FileAttributes;
+                e->file_ref = ntfs_ref_to_frn(rec->FileReferenceNumber);
+                e->parent_ref = ntfs_ref_to_frn(rec->ParentFileReferenceNumber);
+                e->is_directory = (rec->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+                e->volume_index = (signed char)volume_index;
+                e->parent_index = INDEX_PARENT_UNKNOWN;
+                entry_count++;
             }
-            
+
             offset += rec->RecordLength;
         }
-        
-        if (hwnd_progress && (entry_count % 65536) == 0)
+
+        /* Report on growth rather than on an exact multiple: batch sizes vary,
+           so `entry_count % 65536 == 0` almost never hit and the UI sat silent
+           for the whole enumeration. */
+        if (hwnd_progress && entry_count - last_progress >= 65536) {
+            last_progress = entry_count;
             PostMessageW(hwnd_progress, WM_INDEX_PROGRESS, (WPARAM)0, (LPARAM)volume_index);
+        }
     }
-    
+
+enum_done:
     free(buffer);
     
     if (!ok && entry_count == 0) {
@@ -228,15 +284,21 @@ static int ntfs_grow_changes(USN_CHANGE **changes, int *capacity, int needed)
     if (needed <= *capacity)
         return 1;
     
+    if (needed > (int)(INT_MAX / sizeof(USN_CHANGE)))
+        return 0;
+
     int new_cap = *capacity > 0 ? *capacity : 4096;
-    while (new_cap < needed)
+    while (new_cap < needed) {
+        if (new_cap > INT_MAX / 2)
+            return 0;
         new_cap *= 2;
-    
-    USN_CHANGE *new_changes = (USN_CHANGE *)realloc(*changes, new_cap * sizeof(USN_CHANGE));
+    }
+
+    USN_CHANGE *new_changes = (USN_CHANGE *)realloc(*changes, (size_t)new_cap * sizeof(USN_CHANGE));
     if (!new_changes)
         return 0;
-    
-    memset(new_changes + *capacity, 0, (new_cap - *capacity) * sizeof(USN_CHANGE));
+
+    memset(new_changes + *capacity, 0, (size_t)(new_cap - *capacity) * sizeof(USN_CHANGE));
     *changes = new_changes;
     *capacity = new_cap;
     return 1;
@@ -245,23 +307,25 @@ static int ntfs_grow_changes(USN_CHANGE **changes, int *capacity, int needed)
 static int ntfs_add_usn_change(USN_CHANGE **changes, int *count, int *capacity,
                                USN_RECORD_BUF *rec, int volume_index)
 {
-    int name_chars = rec->FileNameLength / sizeof(wchar_t);
-    wchar_t *name_ptr = (wchar_t *)((char *)rec + rec->FileNameOffset);
-    
-    if (rec->MajorVersion != 2 || name_chars <= 0 || name_chars >= 32767)
+    const wchar_t *name_ptr;
+    int name_chars;
+
+    /* A record we cannot bound is skipped, not treated as a read failure. */
+    if (!ntfs_usn_record_name(rec, rec->RecordLength, &name_ptr, &name_chars))
         return 1;
-    
+
     if (!ntfs_grow_changes(changes, capacity, *count + 1))
         return 0;
-    
+
     USN_CHANGE *change = &(*changes)[*count];
     memset(change, 0, sizeof(*change));
-    
-    change->name = (wchar_t *)calloc(name_chars + 1, sizeof(wchar_t));
+
+    change->name = (wchar_t *)calloc((size_t)name_chars + 1, sizeof(wchar_t));
     if (!change->name)
         return 0;
-    
-    wcsncpy_s(change->name, name_chars + 1, name_ptr, name_chars);
+
+    memcpy(change->name, name_ptr, (size_t)name_chars * sizeof(wchar_t));
+    change->name[name_chars] = L'\0';
     change->file_ref = ntfs_ref_to_frn(rec->FileReferenceNumber);
     change->parent_ref = ntfs_ref_to_frn(rec->ParentFileReferenceNumber);
     change->usn = rec->Usn;
@@ -344,14 +408,15 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
         
         while (offset + sizeof(USN_RECORD_BUF) <= bytes) {
             USN_RECORD_BUF *rec = (USN_RECORD_BUF *)(buffer + offset);
-            if (rec->RecordLength == 0 || offset + rec->RecordLength > bytes)
+            if (rec->RecordLength < sizeof(USN_RECORD_BUF) ||
+                offset + rec->RecordLength > bytes)
                 break;
-            
+
             if (!ntfs_add_usn_change(&changes, &change_count, &change_cap, rec, volume_index)) {
                 ok = 0;
                 goto done;
             }
-            
+
             offset += rec->RecordLength;
         }
         
@@ -522,22 +587,15 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
         }
         
         if (name_buf[0]) {
-            if (entry_count >= entry_cap) {
-                int new_cap = entry_cap * 2;
-                INDEX_ENTRY *new_entries = (INDEX_ENTRY *)realloc(entries, new_cap * sizeof(INDEX_ENTRY));
-                if (!new_entries)
-                    break;
-                memset(new_entries + entry_cap, 0, (new_cap - entry_cap) * sizeof(INDEX_ENTRY));
-                entries = new_entries;
-                entry_cap = new_cap;
-            }
-            
+            if (!ntfs_grow_entries(&entries, &entry_cap, entry_count + 1))
+                break;
+
             INDEX_ENTRY *e = &entries[entry_count];
-            
-            size_t name_len = wcslen(name_buf);
-            e->name = (wchar_t *)malloc((name_len + 1) * sizeof(wchar_t));
-            if (e->name) wcscpy_s(e->name, name_len + 1, name_buf);
-            
+
+            /* Skip the record rather than admit a NULL name to the index. */
+            if (!ntfs_fill_entry_from_name(e, name_buf, -1))
+                break;
+
             e->size = real_size;
             e->creation_time = ctime;
             e->modification_time = mtime;
@@ -545,9 +603,10 @@ int ntfs_read_mft(HANDLE hVolume, INDEX_ENTRY **out_entries, int *out_count,
             e->file_ref = frn;
             e->parent_ref = parent_frn;
             e->is_directory = (hdr->Flags & FR_DIRECTORY) ? 1 : 0;
-            e->volume_index = volume_index;
+            e->volume_index = (signed char)volume_index;
+            e->parent_index = INDEX_PARENT_UNKNOWN;
             e->metadata_loaded = 1;
-             
+
             entry_count++;
         }
         
@@ -605,40 +664,56 @@ int ntfs_read_usn_records(HANDLE hVolume, long long start_usn, long long journal
     }
     
     unsigned int offset = sizeof(long long);
-    while (offset < bytes) {
+    /* Require a whole header before dereferencing, and keep each record inside
+       the buffer -- the previous `offset < bytes` walk read past the end. */
+    while (offset + sizeof(USN_RECORD_BUF) <= bytes) {
         USN_RECORD_BUF *rec = (USN_RECORD_BUF *)(buffer + offset);
-        if (rec->RecordLength == 0) break;
-        
-        wchar_t name[512] = {0};
-        wchar_t *name_ptr = (wchar_t *)(buffer + offset + rec->FileNameOffset);
-        int name_chars = rec->FileNameLength / 2;
-        if (name_chars > 511) name_chars = 511;
-        wcsncpy_s(name, 512, name_ptr, name_chars);
-        
+        const wchar_t *name_ptr;
+        int name_chars;
+        wchar_t name[NTFS_MAX_NAME_CHARS + 1];
+
+        if (rec->RecordLength < sizeof(USN_RECORD_BUF) ||
+            offset + rec->RecordLength > bytes)
+            break;
+
+        name[0] = L'\0';
+        if (ntfs_usn_record_name(rec, rec->RecordLength, &name_ptr, &name_chars)) {
+            memcpy(name, name_ptr, (size_t)name_chars * sizeof(wchar_t));
+            name[name_chars] = L'\0';
+        }
+
         if (callback)
             callback(rec, name, ctx);
-        
+
         offset += rec->RecordLength;
     }
-    
+
     free(buffer);
     return 1;
 }
 
 void ntfs_format_attributes(wchar_t *buf, size_t buf_size, unsigned int attrs)
 {
-    int pos = 0;
-    if (attrs & 0x01) pos += swprintf_s(buf + pos, buf_size - pos, L"R");
-    if (attrs & 0x02) pos += swprintf_s(buf + pos, buf_size - pos, L"H");
-    if (attrs & 0x04) pos += swprintf_s(buf + pos, buf_size - pos, L"S");
-    if (attrs & 0x20) pos += swprintf_s(buf + pos, buf_size - pos, L"A");
-    if (attrs & 0x10) pos += swprintf_s(buf + pos, buf_size - pos, L"D");
-    if (attrs & 0x100) pos += swprintf_s(buf + pos, buf_size - pos, L"T");
-    if (attrs & 0x200) pos += swprintf_s(buf + pos, buf_size - pos, L"C");
-    if (attrs & 0x1000) pos += swprintf_s(buf + pos, buf_size - pos, L"P");
-    if (attrs & 0x2000) pos += swprintf_s(buf + pos, buf_size - pos, L"N");
-    if (attrs & 0x4000) pos += swprintf_s(buf + pos, buf_size - pos, L"E");
-    if (attrs & 0x800) pos += swprintf_s(buf + pos, buf_size - pos, L"O");
+    /* Flag order matches the column's historical layout. */
+    static const struct { unsigned int bit; wchar_t letter; } k_flags[] = {
+        { 0x0001, L'R' }, { 0x0002, L'H' }, { 0x0004, L'S' }, { 0x0020, L'A' },
+        { 0x0010, L'D' }, { 0x0100, L'T' }, { 0x0200, L'C' }, { 0x1000, L'P' },
+        { 0x2000, L'N' }, { 0x4000, L'E' }, { 0x0800, L'O' },
+    };
+    size_t pos = 0;
+    size_t i;
+
+    if (!buf || buf_size == 0)
+        return;
+
+    /* Append directly instead of chaining swprintf_s: `buf_size - pos` used to
+       wrap around once pos passed buf_size, and a -1 return drove pos negative
+       so the next write landed before the buffer. */
+    for (i = 0; i < sizeof(k_flags) / sizeof(k_flags[0]); i++) {
+        if ((attrs & k_flags[i].bit) && pos + 1 < buf_size)
+            buf[pos++] = k_flags[i].letter;
+    }
+    buf[pos] = L'\0';
 }
 
 void ntfs_format_size(wchar_t *buf, size_t buf_size, long long bytes)
