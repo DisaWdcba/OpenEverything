@@ -1,4 +1,4 @@
-# OpenEverything v0.2.0
+# OpenEverything v0.2.1
 
 Everything 的开源复刻版本。
 
@@ -19,6 +19,7 @@ build.bat
 - `build/OpenEverything.exe`：Win32 图形界面，同时支持 CLI 和 MCP 模式
 - `build/OpenEverythingCLI.exe`：命令行客户端和 MCP 服务器
 - `build/OpenEverythingService.exe`：后台 NTFS/USN 索引服务
+- `build/OpenEverythingSetup.exe`：内嵌 GUI、CLI 和服务的单文件安装器
 
 附加参数：`--debug`、`--release`、`--clean` 和 `--tests`。
 
@@ -129,10 +130,12 @@ MCP 服务器使用标准输入输出传输，支持逐行 JSON-RPC 和 `Content
 
 ## 索引服务
 
-安装服务需要一次管理员确认。安装程序会把服务和 CLI 复制到 `%ProgramFiles%\OpenEverything`，注册为延迟自动启动的 `LocalSystem` 服务并立即启动：
+安装服务需要一次管理员确认。`OpenEverythingSetup.exe` 内嵌 GUI、CLI 和服务三个程序，单独分发这一个文件即可完成安装。它会将内嵌程序写入 `%ProgramFiles%\OpenEverything`，创建 `%ProgramData%\OpenEverything` 的只读用户缓存目录，注册为延迟自动启动的 `LocalSystem` 服务并立即启动：
+
+普通用户直接双击 `OpenEverythingSetup.exe` 即可使用中文图形安装界面。安装器会检测现有安装，提供安装、更新/修复和卸载操作；安装完成后创建开始菜单入口，并可选择创建桌面快捷方式。
 
 ```powershell
-build\OpenEverythingService.exe install
+build\OpenEverythingSetup.exe install
 ```
 
 安装完成后，普通用户 CMD 和 Agent 可以直接运行：
@@ -146,13 +149,13 @@ build\OpenEverythingService.exe install
 管理命令：
 
 ```powershell
-build\OpenEverythingService.exe status
-build\OpenEverythingService.exe start
-build\OpenEverythingService.exe stop
-build\OpenEverythingService.exe uninstall
+build\OpenEverythingSetup.exe start
+build\OpenEverythingSetup.exe stop
+build\OpenEverythingSetup.exe uninstall
+build\OpenEverythingCLI.exe stats --json
 ```
 
-`install`、`start`、`stop` 和 `uninstall` 会按需触发 UAC；确认后提权子进程会在后台隐藏运行，不显示管理员控制台。查询、`stats`、`update` 和 MCP 调用保持普通用户权限。首次全量建库期间 `stats` 会显示 `building`，CLI 会在服务缓存可用前继续使用原有用户缓存。
+`OpenEverythingSetup.exe` 通过嵌入式清单请求 UAC。双击运行时显示图形安装界面；显式传入 `install`、`update`、`start`、`stop` 或 `uninstall` 时保持静默，不显示管理员控制台。`OpenEverythingService.exe` 只由 Windows 服务控制管理器启动，不再承担提权、复制或注册服务的工作。查询、`stats`、`update` 和 MCP 调用保持普通用户权限。首次全量建库期间 `stats` 会显示 `building`，CLI 会在服务缓存可用前继续使用原有用户缓存。
 
 ## GitHub
 

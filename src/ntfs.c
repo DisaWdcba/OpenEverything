@@ -629,69 +629,6 @@ int ntfs_query_usn_journal(HANDLE hVolume, USN_JOURNAL_DATA_BUF *data)
                            NULL, 0, data, sizeof(USN_JOURNAL_DATA_BUF), &bytes, NULL);
 }
 
-int ntfs_create_usn_journal(HANDLE hVolume, long long max_size)
-{
-    CREATE_USN_JOURNAL_BUF create = {0};
-    create.MaximumSize = max_size;
-    create.AllocationDelta = max_size / 8;
-    
-    DWORD bytes;
-    return DeviceIoControl(hVolume, FSCTL_CREATE_USN_JOURNAL,
-                           &create, sizeof(create), NULL, 0, &bytes, NULL);
-}
-
-int ntfs_read_usn_records(HANDLE hVolume, long long start_usn, long long journal_id,
-                           void (*callback)(USN_RECORD_BUF *record, wchar_t *name, void *ctx),
-                           void *ctx)
-{
-    READ_USN_JOURNAL_BUF read = {0};
-    read.StartUsn = start_usn;
-    read.ReasonMask = 0xFFFFFFFF;
-    read.ReturnOnlyOnClose = 0;
-    read.Timeout = 0;
-    read.BytesToWaitFor = 0;
-    read.UsnJournalId = journal_id;
-    
-    char *buffer = (char *)malloc(65536);
-    if (!buffer) return 0;
-    
-    DWORD bytes;
-    if (!DeviceIoControl(hVolume, FSCTL_READ_USN_JOURNAL,
-                         &read, sizeof(read),
-                         buffer, 65536, &bytes, NULL)) {
-        free(buffer);
-        return 0;
-    }
-    
-    unsigned int offset = sizeof(long long);
-    /* Require a whole header before dereferencing, and keep each record inside
-       the buffer -- the previous `offset < bytes` walk read past the end. */
-    while (offset + sizeof(USN_RECORD_BUF) <= bytes) {
-        USN_RECORD_BUF *rec = (USN_RECORD_BUF *)(buffer + offset);
-        const wchar_t *name_ptr;
-        int name_chars;
-        wchar_t name[NTFS_MAX_NAME_CHARS + 1];
-
-        if (rec->RecordLength < sizeof(USN_RECORD_BUF) ||
-            offset + rec->RecordLength > bytes)
-            break;
-
-        name[0] = L'\0';
-        if (ntfs_usn_record_name(rec, rec->RecordLength, &name_ptr, &name_chars)) {
-            memcpy(name, name_ptr, (size_t)name_chars * sizeof(wchar_t));
-            name[name_chars] = L'\0';
-        }
-
-        if (callback)
-            callback(rec, name, ctx);
-
-        offset += rec->RecordLength;
-    }
-
-    free(buffer);
-    return 1;
-}
-
 void ntfs_format_attributes(wchar_t *buf, size_t buf_size, unsigned int attrs)
 {
     /* Flag order matches the column's historical layout. */

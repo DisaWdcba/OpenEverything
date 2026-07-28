@@ -16,9 +16,6 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
                           int max_changes);
 void ntfs_free_usn_changes(USN_CHANGE *changes, int count);
 int ntfs_query_usn_journal(HANDLE hVolume, USN_JOURNAL_DATA_BUF *data);
-int ntfs_create_usn_journal(HANDLE hVolume, long long max_size);
-int ntfs_read_usn_records(HANDLE hVolume, long long start_usn, long long journal_id,
-                           void (*callback)(USN_RECORD_BUF *record, wchar_t *name, void *ctx), void *ctx);
 void ntfs_format_attributes(wchar_t *buf, size_t buf_size, unsigned int attrs);
 void ntfs_format_size(wchar_t *buf, size_t buf_size, long long bytes);
 long long ntfs_filetime_to_unix(long long ft);

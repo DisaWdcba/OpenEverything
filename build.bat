@@ -42,11 +42,14 @@ if "%DO_CLEAN%"=="1" (
     if exist "%OUT_DIR%\OpenEverything.exe" del /q "%OUT_DIR%\OpenEverything.exe"
     if exist "%OUT_DIR%\OpenEverythingCLI.exe" del /q "%OUT_DIR%\OpenEverythingCLI.exe"
     if exist "%OUT_DIR%\OpenEverythingService.exe" del /q "%OUT_DIR%\OpenEverythingService.exe"
+    if exist "%OUT_DIR%\OpenEverythingSetup.exe" del /q "%OUT_DIR%\OpenEverythingSetup.exe"
     if exist "%OUT_DIR%\OpenEverythingCLI.res" del /q "%OUT_DIR%\OpenEverythingCLI.res"
     if exist "%OUT_DIR%\cache_roundtrip.exe" del /q "%OUT_DIR%\cache_roundtrip.exe"
     if exist "%OUT_DIR%\json_tests.exe" del /q "%OUT_DIR%\json_tests.exe"
     if exist "%OUT_DIR%\service_client_tests.exe" del /q "%OUT_DIR%\service_client_tests.exe"
     if exist "%OUT_DIR%\gui_console_tests.exe" del /q "%OUT_DIR%\gui_console_tests.exe"
+    if exist "%OUT_DIR%\installer_resources_tests.exe" del /q "%OUT_DIR%\installer_resources_tests.exe"
+    if exist "%OUT_DIR%\OpenEverythingSetupPreview.exe" del /q "%OUT_DIR%\OpenEverythingSetupPreview.exe"
     echo.
 )
 
@@ -57,7 +60,7 @@ if "%DO_CLEAN%"=="1" (
 :: ("Program Files (x86)").
 set VCVARS=
 set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
-set VSWHERE_OUT=%TEMP%\openeverything_vswhere.tmp
+set VSWHERE_OUT=%TEMP%\openeverything_vswhere_%RANDOM%_%RANDOM%.tmp
 
 if exist "%VSWHERE%" (
     "%VSWHERE%" -latest -products * -find VC\Auxiliary\Build\vcvars64.bat >"%VSWHERE_OUT%" 2>nul
@@ -119,7 +122,7 @@ if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 set MODULES=ntfs index search config cache ipc ui main
 
 :: ---- Compile ----
-echo [1/7] Compiling GUI modules (%CONFIG%) ...
+echo [1/8] Compiling GUI modules (%CONFIG%) ...
 set OBJS=
 for %%m in (%MODULES%) do (
     echo   - %%m.c
@@ -133,7 +136,7 @@ for %%m in (%MODULES%) do (
 )
 
 :: ---- Shared CLI and MCP runtime ----
-echo [2/7] Compiling shared CLI and MCP runtime ...
+echo [2/8] Compiling shared CLI and MCP runtime ...
 cl %CFLAGS% /c /Fo"%OUT_DIR%\service_client.obj" /Fd"%OUT_DIR%\OpenEverythingCLI.pdb" "%SRC_DIR%\service_client.c"
 if errorlevel 1 (
     echo.
@@ -160,7 +163,7 @@ if errorlevel 1 (
 )
 
 :: ---- Resources ----
-echo [3/7] Compiling resources ...
+echo [3/8] Compiling resources ...
 rc /nologo /fo "%OUT_DIR%\OpenEverything.res" "%SRC_DIR%\OpenEverything.rc"
 if errorlevel 1 (
     echo.
@@ -173,9 +176,14 @@ if errorlevel 1 (
     echo Build FAILED while compiling OpenEverythingCLI.rc.
     exit /b 1
 )
-
+rc /nologo /fo "%OUT_DIR%\OpenEverythingService.res" "%SRC_DIR%\OpenEverythingService.rc"
+if errorlevel 1 (
+    echo.
+    echo Build FAILED while compiling OpenEverythingService.rc.
+    exit /b 1
+)
 :: ---- Link dual-mode GUI ----
-echo [4/7] Linking GUI with CLI and MCP support ...
+echo [4/8] Linking GUI with CLI and MCP support ...
 cl %CFLAGS% /Fe"%OUT_DIR%\OpenEverything.exe" !OBJS! ^
     "%OUT_DIR%\cli.obj" "%OUT_DIR%\json.obj" "%OUT_DIR%\service_client.obj" ^
     "%OUT_DIR%\OpenEverything.res" /link %LDFLAGS% %LDEXTRA%
@@ -186,7 +194,7 @@ if errorlevel 1 (
 )
 
 :: ---- Standalone CLI and MCP server ----
-echo [5/7] Linking CLI and MCP server ...
+echo [5/8] Linking CLI and MCP server ...
 cl %CFLAGS% /Fe"%OUT_DIR%\OpenEverythingCLI.exe" ^
     "%OUT_DIR%\cli_main.obj" "%OUT_DIR%\cli.obj" ^
     "%OUT_DIR%\json.obj" "%OUT_DIR%\service_client.obj" ^
@@ -201,7 +209,7 @@ if errorlevel 1 (
 )
 
 :: ---- Privileged indexing service ----
-echo [6/7] Compiling indexing service ...
+echo [6/8] Compiling indexing service ...
 cl %CFLAGS% /c /Fo"%OUT_DIR%\service.obj" /Fd"%OUT_DIR%\OpenEverythingService.pdb" "%SRC_DIR%\service.c"
 if errorlevel 1 (
     echo.
@@ -209,15 +217,39 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [7/7] Linking indexing service ...
+echo [7/8] Linking indexing service ...
 cl %CFLAGS% /Fe"%OUT_DIR%\OpenEverythingService.exe" ^
     "%OUT_DIR%\service.obj" "%OUT_DIR%\service_client.obj" ^
     "%OUT_DIR%\cache.obj" "%OUT_DIR%\config.obj" ^
     "%OUT_DIR%\index.obj" "%OUT_DIR%\ntfs.obj" ^
+    "%OUT_DIR%\OpenEverythingService.res" ^
     /link %LDFLAGS% %LDEXTRA%
 if errorlevel 1 (
     echo.
     echo Build FAILED while linking OpenEverythingService.exe.
+    exit /b 1
+)
+
+:: ---- Privileged service installer ----
+echo [8/8] Building service installer ...
+cl %CFLAGS% /c /Fo"%OUT_DIR%\installer.obj" /Fd"%OUT_DIR%\OpenEverythingSetup.pdb" "%SRC_DIR%\installer.c"
+if errorlevel 1 (
+    echo.
+    echo Build FAILED while compiling installer.c.
+    exit /b 1
+)
+rc /nologo /fo "%OUT_DIR%\OpenEverythingSetup.res" "%SRC_DIR%\OpenEverythingSetup.rc"
+if errorlevel 1 (
+    echo.
+    echo Build FAILED while compiling the self-contained setup resources.
+    exit /b 1
+)
+cl %CFLAGS% /Fe"%OUT_DIR%\OpenEverythingSetup.exe" ^
+    "%OUT_DIR%\installer.obj" "%OUT_DIR%\OpenEverythingSetup.res" ^
+    /link %LDFLAGS% uuid.lib /SUBSYSTEM:WINDOWS %LDEXTRA%
+if errorlevel 1 (
+    echo.
+    echo Build FAILED while linking OpenEverythingSetup.exe.
     exit /b 1
 )
 
@@ -266,6 +298,40 @@ if "%BUILD_TESTS%"=="1" (
         exit /b 1
     )
     echo   Output: %OUT_DIR%\gui_console_tests.exe
+    cl %CFLAGS% /I"%SRC_DIR%" /Fe"%OUT_DIR%\installer_resources_tests.exe" /Fo"%OUT_DIR%\tests\\" ^
+        "%TEST_DIR%\installer_resources_tests.c" ^
+        /link /nologo kernel32.lib %LDEXTRA%
+    if errorlevel 1 (
+        echo.
+        echo Build FAILED while building installer_resources_tests.exe.
+        exit /b 1
+    )
+    echo   Output: %OUT_DIR%\installer_resources_tests.exe
+    cl %CFLAGS% /DOE_SETUP_PREVIEW /I"%SRC_DIR%" /c ^
+        /Fo"%OUT_DIR%\tests\installer_preview.obj" ^
+        /Fd"%OUT_DIR%\OpenEverythingSetupPreview.pdb" "%SRC_DIR%\installer.c"
+    if errorlevel 1 (
+        echo.
+        echo Build FAILED while compiling the setup UI preview.
+        exit /b 1
+    )
+    rc /nologo /i "%SRC_DIR%" /fo "%OUT_DIR%\OpenEverythingSetupPreview.res" ^
+        "%TEST_DIR%\OpenEverythingSetupPreview.rc"
+    if errorlevel 1 (
+        echo.
+        echo Build FAILED while compiling the setup UI preview resources.
+        exit /b 1
+    )
+    cl %CFLAGS% /Fe"%OUT_DIR%\OpenEverythingSetupPreview.exe" ^
+        "%OUT_DIR%\tests\installer_preview.obj" ^
+        "%OUT_DIR%\OpenEverythingSetupPreview.res" ^
+        /link %LDFLAGS% uuid.lib /SUBSYSTEM:WINDOWS %LDEXTRA%
+    if errorlevel 1 (
+        echo.
+        echo Build FAILED while linking OpenEverythingSetupPreview.exe.
+        exit /b 1
+    )
+    echo   Output: %OUT_DIR%\OpenEverythingSetupPreview.exe
 )
 
 echo.
@@ -274,5 +340,6 @@ echo   Build SUCCESSFUL (%CONFIG%)
 echo   GUI + CLI/MCP: %OUT_DIR%\OpenEverything.exe
 echo   Standalone CLI/MCP: %OUT_DIR%\OpenEverythingCLI.exe
 echo   Service: %OUT_DIR%\OpenEverythingService.exe
+echo   Service installer: %OUT_DIR%\OpenEverythingSetup.exe
 echo ==========================================
 exit /b 0
