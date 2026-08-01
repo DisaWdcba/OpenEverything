@@ -372,15 +372,20 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
+    /* Writable names live in data. A current cache can additionally provide a
+     * read-only mapped prefix; offsets address the two regions as one logical
+     * pool, so USN updates append without copying the mapped names. */
     char *data;
     size_t size;
     size_t capacity;
+    const char *mapped_data;
+    size_t mapped_size;
+    void *mapped_view;
 } INDEX_NAME_POOL;
 
 /* Runtime entry. Names live in APP_STATE.name_pool as UTF-8 and are addressed
- * by a 32-bit offset. The layout is 64 bytes on x64, down from the previous
- * pointer-based 72-byte entry, while the pool cuts ASCII-heavy name storage in
- * half compared with UTF-16. */
+ * by a 32-bit offset. The layout remains 64 bytes on x64; the compact cache
+ * representation saves memory by mapping names instead of copying them. */
 typedef struct {
     long long size;
     long long creation_time;

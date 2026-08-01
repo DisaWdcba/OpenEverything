@@ -1363,7 +1363,12 @@ static DWORD WINAPI reindex_thread_proc(void *p)
     if (a->entry_count > 0) {
         PostMessageW(c->hwnd, WM_INDEX_PROGRESS,
                      (WPARAM)(INT_PTR)INDEX_PROGRESS_SAVING, 0);
-        cache_save_index(a);
+        if (cache_save_index(a) &&
+            cache_load_index(a) == CACHE_LOAD_CURRENT) {
+            index_build_filter_index(a);
+            index_build_ref_index(a);
+            index_build_name_char_index(a);
+        }
     }
     PostMessageW(c->hwnd, WM_INDEX_DONE, 0, 0);
     InterlockedExchange(&g_reindexing, 0);

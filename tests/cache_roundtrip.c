@@ -475,10 +475,14 @@ static int run_memory_probe(const wchar_t *directory)
     index_sort_entries_by_name(&app);
     QueryPerformanceCounter(&end);
     sort_ms = elapsed_milliseconds(start, end, frequency);
-    QueryPerformanceCounter(&start);
-    result = result != CACHE_LOAD_FAILED && index_compact_entry_names(&app);
-    QueryPerformanceCounter(&end);
-    compact_ms = elapsed_milliseconds(start, end, frequency);
+    if (result == CACHE_LOAD_CURRENT && app.name_pool.mapped_view) {
+        compact_ms = 0.0;
+    } else {
+        QueryPerformanceCounter(&start);
+        result = result != CACHE_LOAD_FAILED && index_compact_entry_names(&app);
+        QueryPerformanceCounter(&end);
+        compact_ms = elapsed_milliseconds(start, end, frequency);
+    }
     QueryPerformanceCounter(&start);
     result = result && index_build_filter_index(&app);
     QueryPerformanceCounter(&end);
@@ -507,6 +511,8 @@ static int run_memory_probe(const wchar_t *directory)
     wprintf(L"entry_size=%zu\n", sizeof(INDEX_ENTRY));
     wprintf(L"entry_capacity=%d\n", app.entry_capacity);
     wprintf(L"ref_capacity=%d\n", app.ref_index_capacity);
+    wprintf(L"mapped_name_mb=%.2f\n",
+            (double)app.name_pool.mapped_size / (1024.0 * 1024.0));
     wprintf(L"sort_ms=%.3f\n", sort_ms);
     wprintf(L"compact_ms=%.3f\n", compact_ms);
     wprintf(L"filter_ms=%.3f\n", filter_ms);
@@ -689,6 +695,12 @@ int wmain(int argc, wchar_t **argv)
         destroy_app(&app);
         return 1;
     }
+    if (!app.name_pool.mapped_view ||
+        app.name_pool.mapped_size != app.name_pool.size) {
+        fwprintf(stderr, L"Current cache names are not file mapped\n");
+        destroy_app(&app);
+        return 1;
+    }
 
     if (!index_build_ref_index(&app)) {
         fwprintf(stderr, L"Failed to build V4 reference index\n");
@@ -716,6 +728,23 @@ int wmain(int argc, wchar_t **argv)
                      L"Query %d mismatch: V3=%d/%016llx V4=%d/%016llx\n",
                      i, v3_queries[i].count, v3_queries[i].hash,
                      v4_queries[i].count, v4_queries[i].hash);
+            ok = 0;
+        }
+    }
+
+    {
+        INDEX_ENTRY overlay_entry;
+        void *mapped_view = app.name_pool.mapped_view;
+        size_t mapped_size = app.name_pool.mapped_size;
+        memset(&overlay_entry, 0, sizeof(overlay_entry));
+        overlay_entry.file_ref = LLONG_MAX;
+        overlay_entry.parent_ref = 5;
+        overlay_entry.parent_index = INDEX_PARENT_UNKNOWN;
+        if (!index_add_entry(&app, &overlay_entry, L"mapped-overlay-probe") ||
+            app.name_pool.mapped_view != mapped_view ||
+            app.name_pool.mapped_size != mapped_size ||
+            !app.name_pool.data) {
+            fwprintf(stderr, L"Mapped name overlay test failed\n");
             ok = 0;
         }
     }

@@ -362,6 +362,10 @@ static int service_save_index(APP_STATE *app, const wchar_t *index_path)
                                                  : ERROR_WRITE_FAULT);
         return 0;
     }
+    /* Reopen the V6 cache so the immutable UTF-8 name prefix is file-backed.
+       Later USN changes append to the pool's small writable overlay. */
+    if (cache_load_index_from_path(app, index_path) == CACHE_LOAD_CURRENT)
+        index_build_ref_index(app);
     InterlockedExchange64(&g_last_update_unix, service_unix_now());
     InterlockedIncrement(&g_update_sequence);
     return 1;

@@ -1,4 +1,4 @@
-# OpenEverything v0.2.2
+# OpenEverything v0.2.3
 
 Everything 的开源复刻版本。
 

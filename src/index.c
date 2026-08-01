@@ -20,6 +20,8 @@ void index_name_pool_free(INDEX_NAME_POOL *pool)
     if (!pool)
         return;
     free(pool->data);
+    if (pool->mapped_view)
+        UnmapViewOfFile(pool->mapped_view);
     memset(pool, 0, sizeof(*pool));
 }
 
@@ -27,29 +29,45 @@ static int index_name_pool_reserve(INDEX_NAME_POOL *pool, size_t needed)
 {
     char *grown;
     size_t capacity;
+    size_t owned_capacity;
+    size_t owned_needed;
 
     if (!pool || needed > UINT32_MAX)
         return 0;
     if (needed <= pool->capacity)
         return 1;
 
-    capacity = pool->capacity > 0 ? pool->capacity : 65536;
-    while (capacity < needed) {
+    if (pool->mapped_size > pool->size || pool->mapped_size > pool->capacity ||
+        needed < pool->mapped_size) {
+        return 0;
+    }
+    owned_needed = needed - pool->mapped_size;
+    owned_capacity = pool->capacity - pool->mapped_size;
+    capacity = owned_capacity > 0 ? owned_capacity : 65536;
+    while (capacity < owned_needed) {
         size_t next = capacity + capacity / 2 + 4096;
-        if (next <= capacity || next > UINT32_MAX) {
-            capacity = UINT32_MAX;
+        size_t max_owned = UINT32_MAX - pool->mapped_size;
+        if (next <= capacity || next > max_owned) {
+            capacity = max_owned;
             break;
         }
         capacity = next;
     }
-    if (capacity < needed)
+    if (capacity < owned_needed)
         return 0;
     grown = (char *)realloc(pool->data, capacity);
     if (!grown)
         return 0;
     pool->data = grown;
-    pool->capacity = capacity;
+    pool->capacity = pool->mapped_size + capacity;
     return 1;
+}
+
+static char *index_name_pool_write_cursor(INDEX_NAME_POOL *pool)
+{
+    if (!pool || pool->size < pool->mapped_size || !pool->data)
+        return NULL;
+    return pool->data + (pool->size - pool->mapped_size);
 }
 
 int index_name_pool_append_utf8(INDEX_NAME_POOL *pool, const char *name,
@@ -69,9 +87,14 @@ int index_name_pool_append_utf8(INDEX_NAME_POOL *pool, const char *name,
 
     *offset = (unsigned int)pool->size;
     *utf8_length = (unsigned short)name_length;
-    if (name_length > 0)
-        memcpy(pool->data + pool->size, name, name_length);
-    pool->data[pool->size + name_length] = '\0';
+    {
+        char *dst = index_name_pool_write_cursor(pool);
+        if (!dst)
+            return 0;
+        if (name_length > 0)
+            memcpy(dst, name, name_length);
+        dst[name_length] = '\0';
+    }
     pool->size = needed;
     return 1;
 }
@@ -106,11 +129,15 @@ int index_name_pool_append_wide(INDEX_NAME_POOL *pool, const wchar_t *name,
         return 0;
     *offset = (unsigned int)pool->size;
     *utf8_length = (unsigned short)bytes;
-    if (WideCharToMultiByte(CP_UTF8, 0, name, (int)name_length,
-                            pool->data + pool->size, bytes, NULL, NULL) != bytes) {
-        return 0;
+    {
+        char *dst = index_name_pool_write_cursor(pool);
+        if (!dst ||
+            WideCharToMultiByte(CP_UTF8, 0, name, (int)name_length,
+                                dst, bytes, NULL, NULL) != bytes) {
+            return 0;
+        }
+        dst[bytes] = '\0';
     }
-    pool->data[pool->size + bytes] = '\0';
     pool->size = needed;
     return 1;
 }
@@ -118,12 +145,27 @@ int index_name_pool_append_wide(INDEX_NAME_POOL *pool, const wchar_t *name,
 const char *index_name_pool_at(const INDEX_NAME_POOL *pool,
                                unsigned int offset, unsigned short length)
 {
-    if (!pool || !pool->data || offset == INDEX_NAME_OFFSET_NONE ||
-        offset > pool->size || (size_t)length >= pool->size - offset ||
-        pool->data[offset + length] != '\0') {
+    const char *base;
+    size_t region_offset;
+    size_t region_size;
+
+    if (!pool || offset == INDEX_NAME_OFFSET_NONE || offset >= pool->size)
+        return "";
+    if ((size_t)offset < pool->mapped_size) {
+        base = pool->mapped_data;
+        region_offset = offset;
+        region_size = pool->mapped_size;
+    } else {
+        base = pool->data;
+        region_offset = (size_t)offset - pool->mapped_size;
+        region_size = pool->size - pool->mapped_size;
+    }
+    if (!base || region_offset > region_size ||
+        (size_t)length >= region_size - region_offset ||
+        base[region_offset + length] != '\0') {
         return "";
     }
-    return pool->data + offset;
+    return base + region_offset;
 }
 
 void index_build_init(INDEX_BUILD *build)
@@ -1293,6 +1335,7 @@ int index_add_entry(APP_STATE *app, INDEX_ENTRY *entry, const wchar_t *name)
 
 int index_add_entries(APP_STATE *app, INDEX_BUILD *build)
 {
+    char *name_dst;
     unsigned int base_offset;
     size_t merged_size;
 
@@ -1328,8 +1371,12 @@ int index_add_entries(APP_STATE *app, INDEX_BUILD *build)
         return 0;
     }
     base_offset = (unsigned int)app->name_pool.size;
-    memcpy(app->name_pool.data + app->name_pool.size,
-           build->names.data, build->names.size);
+    name_dst = index_name_pool_write_cursor(&app->name_pool);
+    if (!name_dst) {
+        LeaveCriticalSection(&app->index_lock);
+        return 0;
+    }
+    memcpy(name_dst, build->names.data, build->names.size);
     app->name_pool.size = merged_size;
     for (int i = 0; i < build->count; i++) {
         INDEX_ENTRY entry = build->entries[i];

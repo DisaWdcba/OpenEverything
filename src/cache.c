@@ -7,9 +7,11 @@
 #define CACHE_MAGIC_V3 "ECIDX3"
 #define CACHE_MAGIC_V4 "ECIDX4"
 #define CACHE_MAGIC_V5 "ECIDX5"
+#define CACHE_MAGIC_V6 "ECIDX6"
 #define CACHE_VERSION_V3 3
 #define CACHE_VERSION_V4 4
-#define CACHE_VERSION 5
+#define CACHE_VERSION_V5 5
+#define CACHE_VERSION 6
 #define CACHE_MAX_STRING_LEN 32767U
 #define CACHE_IO_BATCH 2048
 #define CACHE_PARENT_NONE (-1)
@@ -72,6 +74,8 @@ typedef struct {
 
 typedef CACHE_HEADER_V4 CACHE_HEADER_V5;
 typedef CACHE_ENTRY_V4 CACHE_ENTRY_V5;
+typedef CACHE_HEADER_V4 CACHE_HEADER_V6;
+typedef CACHE_ENTRY_V4 CACHE_ENTRY_V6;
 
 typedef char cache_header_v4_size_must_be_64[
     sizeof(CACHE_HEADER_V4) == 64 ? 1 : -1];
@@ -92,6 +96,8 @@ typedef struct {
     int volume_count;
     int entry_count;
     int entry_capacity;
+    size_t mapped_name_offset;
+    size_t mapped_name_bytes;
 } CACHE_LOAD_DATA;
 
 void cache_get_index_path(wchar_t *buf, size_t size)
@@ -215,24 +221,6 @@ static int cache_append_wide_name(const unsigned char **cursor,
     return 1;
 }
 
-static int cache_entry_name_length_locked(APP_STATE *app,
-                                          const INDEX_ENTRY *entry,
-                                          size_t *out_length)
-{
-    const char *name;
-    int chars;
-
-    if (!app || !entry || !out_length)
-        return 0;
-    name = index_entry_name_utf8_locked(app, entry);
-    chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name,
-                                entry->name_length, NULL, 0);
-    if (entry->name_length > 0 && chars == 0)
-        return 0;
-    *out_length = (size_t)chars;
-    return 1;
-}
-
 static int cache_ref_compare(const void *a, const void *b)
 {
     const CACHE_REF_LOOKUP *ra = (const CACHE_REF_LOOKUP *)a;
@@ -280,19 +268,19 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     wchar_t path[MAX_PATH];
     wchar_t temp_path[MAX_PATH];
     FILE *f = NULL;
-    CACHE_HEADER_V5 header;
+    CACHE_HEADER_V6 header;
     VOLUME_INFO volumes[26];
     CACHE_REF_LOOKUP *lookup = NULL;
-    CACHE_ENTRY_V5 *record_batch = NULL;
+    CACHE_ENTRY_V6 *record_batch = NULL;
     unsigned short *path_lengths = NULL;
-    wchar_t *name_batch = NULL;
+    char *name_batch = NULL;
     size_t name_batch_capacity = 0;
     LONG revision;
     int entry_count;
     int volume_count;
-    uint64_t name_chars = 0;
+    uint64_t name_bytes = 0;
     uint64_t path_chars = 0;
-    uint64_t written_name_chars = 0;
+    uint64_t written_name_bytes = 0;
     int ok = 1;
 
     if (!app || !target_path || !target_path[0] ||
@@ -317,7 +305,7 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
 
     lookup = (CACHE_REF_LOOKUP *)malloc(
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*lookup));
-    record_batch = (CACHE_ENTRY_V5 *)malloc(
+    record_batch = (CACHE_ENTRY_V6 *)malloc(
         CACHE_IO_BATCH * sizeof(*record_batch));
     path_lengths = (unsigned short *)malloc(
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*path_lengths));
@@ -355,12 +343,14 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
         } else {
             for (; ok && i < batch_end; i++) {
                 INDEX_ENTRY *entry = &app->entries[i];
-                size_t name_len;
+                const char *name = index_entry_name_utf8_locked(app, entry);
+                size_t name_len = entry->name_length;
                 size_t path_len;
 
                 if (entry->volume_index < 0 ||
                     entry->volume_index >= volume_count ||
-                    !cache_entry_name_length_locked(app, entry, &name_len)) {
+                    (name_len > 0 && name[0] == '\0') ||
+                    name[name_len] != '\0') {
                     ok = 0;
                     break;
                 }
@@ -369,13 +359,13 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
                 path_len = index_entry_path_length_locked(app, i);
                 if (name_len > CACHE_MAX_STRING_LEN ||
                     path_len > CACHE_MAX_STRING_LEN ||
-                    name_chars > UINT64_MAX - (name_len + 1) ||
+                    name_bytes > UINT64_MAX - (name_len + 1) ||
                     path_chars > UINT64_MAX - path_len) {
                     ok = 0;
                     break;
                 }
                 path_lengths[i] = (unsigned short)path_len;
-                name_chars += name_len + 1;
+                name_bytes += name_len + 1;
                 path_chars += path_len;
             }
         }
@@ -399,14 +389,14 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     }
 
     memset(&header, 0, sizeof(header));
-    memcpy(header.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5));
+    memcpy(header.magic, CACHE_MAGIC_V6, sizeof(CACHE_MAGIC_V6));
     header.version = CACHE_VERSION;
     header.header_size = sizeof(header);
     header.volume_count = volume_count;
     header.entry_count = entry_count;
     header.volume_record_size = sizeof(VOLUME_INFO);
-    header.entry_record_size = sizeof(CACHE_ENTRY_V5);
-    header.name_chars = name_chars;
+    header.entry_record_size = sizeof(CACHE_ENTRY_V6);
+    header.name_chars = name_bytes;
     header.path_chars = path_chars;
 
     if (ok && fwrite(&header, sizeof(header), 1, f) != 1)
@@ -428,12 +418,14 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
         } else {
             for (; ok && i < batch_end; i++) {
                 INDEX_ENTRY *entry = &app->entries[i];
-                CACHE_ENTRY_V5 *ce = &record_batch[i - batch_start];
-                size_t name_len;
+                CACHE_ENTRY_V6 *ce = &record_batch[i - batch_start];
+                const char *name = index_entry_name_utf8_locked(app, entry);
+                size_t name_len = entry->name_length;
                 size_t path_len = path_lengths[i];
 
-                if (!cache_entry_name_length_locked(app, entry, &name_len) ||
-                    name_len > CACHE_MAX_STRING_LEN ||
+                if (name_len > CACHE_MAX_STRING_LEN ||
+                    (name_len > 0 && name[0] == '\0') ||
+                    name[name_len] != '\0' ||
                     path_len > CACHE_MAX_STRING_LEN ||
                     entry->volume_index < 0 || entry->volume_index >= volume_count) {
                     ok = 0;
@@ -477,7 +469,7 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     for (int i = 0; ok && i < entry_count; ) {
         int batch_start = i;
         int batch_end = i + CACHE_IO_BATCH;
-        size_t batch_chars = 0;
+        size_t batch_bytes = 0;
         if (batch_end > entry_count)
             batch_end = entry_count;
 
@@ -487,32 +479,34 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
         } else {
             for (int n = batch_start; ok && n < batch_end; n++) {
                 INDEX_ENTRY *entry = &app->entries[n];
-                size_t name_len;
+                const char *name = index_entry_name_utf8_locked(app, entry);
+                size_t name_len = entry->name_length;
 
-                if (!cache_entry_name_length_locked(app, entry, &name_len) ||
-                    name_len > CACHE_MAX_STRING_LEN ||
-                    batch_chars > SIZE_MAX - (name_len + 1)) {
+                if (name_len > CACHE_MAX_STRING_LEN ||
+                    (name_len > 0 && name[0] == '\0') ||
+                    name[name_len] != '\0' ||
+                    batch_bytes > SIZE_MAX - (name_len + 1)) {
                     ok = 0;
                     break;
                 }
-                batch_chars += name_len + 1;
+                batch_bytes += name_len + 1;
             }
         }
         LeaveCriticalSection(&app->index_lock);
 
-        if (ok && batch_chars > name_batch_capacity) {
-            wchar_t *next = (wchar_t *)realloc(
-                name_batch, (batch_chars > 0 ? batch_chars : 1) * sizeof(wchar_t));
+        if (ok && batch_bytes > name_batch_capacity) {
+            char *next = (char *)realloc(
+                name_batch, batch_bytes > 0 ? batch_bytes : 1);
             if (!next) {
                 ok = 0;
             } else {
                 name_batch = next;
-                name_batch_capacity = batch_chars;
+                name_batch_capacity = batch_bytes;
             }
         }
 
         if (ok) {
-            wchar_t *dst = name_batch;
+            char *dst = name_batch;
             EnterCriticalSection(&app->index_lock);
             if (!cache_index_snapshot_matches(app, entry_count, volume_count, revision)) {
                 ok = 0;
@@ -520,44 +514,34 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
                 for (int n = batch_start; n < batch_end; n++) {
                     INDEX_ENTRY *entry = &app->entries[n];
                     const char *name = index_entry_name_utf8_locked(app, entry);
-                    size_t name_len;
-                    int converted;
+                    size_t stored = (size_t)entry->name_length + 1;
 
-                    if (!cache_entry_name_length_locked(app, entry, &name_len)) {
+                    if ((entry->name_length > 0 && name[0] == '\0') ||
+                        name[entry->name_length] != '\0') {
                         ok = 0;
                         break;
                     }
-                    converted = name_len > 0
-                        ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                              name, entry->name_length,
-                                              dst, (int)name_len)
-                        : 0;
-                    if ((name_len > 0 && converted != (int)name_len) ||
-                        name_len > INT_MAX) {
-                        ok = 0;
-                        break;
-                    }
-                    dst[name_len] = L'\0';
-                    dst += name_len + 1;
+                    memcpy(dst, name, stored);
+                    dst += stored;
                 }
             }
             LeaveCriticalSection(&app->index_lock);
         }
 
-        if (ok && batch_chars > 0 &&
-            fwrite(name_batch, sizeof(wchar_t), batch_chars, f) != batch_chars)
+        if (ok && batch_bytes > 0 &&
+            fwrite(name_batch, 1, batch_bytes, f) != batch_bytes)
             ok = 0;
         if (ok) {
-            if (written_name_chars > UINT64_MAX - batch_chars)
+            if (written_name_bytes > UINT64_MAX - batch_bytes)
                 ok = 0;
             else
-                written_name_chars += batch_chars;
+                written_name_bytes += batch_bytes;
         }
         i = batch_end;
         Sleep(0);
     }
 
-    if (written_name_chars != name_chars)
+    if (written_name_bytes != name_bytes)
         ok = 0;
     if (ok && fflush(f) != 0)
         ok = 0;
@@ -824,7 +808,7 @@ static int cache_load_v5_data(const unsigned char *view, size_t file_size,
     memset(&header, 0, sizeof(header));
     if (!cache_take_bytes(&cursor, end, &header, sizeof(header)) ||
         memcmp(header.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5)) != 0 ||
-        header.version != CACHE_VERSION ||
+        header.version != CACHE_VERSION_V5 ||
         header.header_size != sizeof(CACHE_HEADER_V5) ||
         header.volume_record_size != sizeof(VOLUME_INFO) ||
         header.entry_record_size != sizeof(CACHE_ENTRY_V5) ||
@@ -935,6 +919,168 @@ fail:
     return 0;
 }
 
+static int cache_load_v6_data(const unsigned char *view, size_t file_size,
+                              CACHE_LOAD_DATA *data)
+{
+    const unsigned char *cursor = view;
+    const unsigned char *end = view + file_size;
+    const unsigned char *records;
+    const unsigned char *names;
+    CACHE_HEADER_V6 header;
+    uint64_t name_cursor = 0;
+    uint64_t path_chars = 0;
+    size_t record_bytes;
+    size_t name_bytes;
+
+    memset(&header, 0, sizeof(header));
+    if (!cache_take_bytes(&cursor, end, &header, sizeof(header)) ||
+        memcmp(header.magic, CACHE_MAGIC_V6, sizeof(CACHE_MAGIC_V6)) != 0 ||
+        header.version != CACHE_VERSION ||
+        header.header_size != sizeof(CACHE_HEADER_V6) ||
+        header.volume_record_size != sizeof(VOLUME_INFO) ||
+        header.entry_record_size != sizeof(CACHE_ENTRY_V6) ||
+        header.volume_count < 0 || header.volume_count > 26 ||
+        header.entry_count < 0 || header.name_chars > UINT32_MAX) {
+        return 0;
+    }
+
+    data->volume_count = header.volume_count;
+    data->entry_count = header.entry_count;
+    data->entry_capacity = cache_load_capacity(header.entry_count);
+    if (header.volume_count > 0) {
+        size_t volume_bytes = sizeof(VOLUME_INFO) * (size_t)header.volume_count;
+        if (!cache_take_bytes(&cursor, end, data->volumes, volume_bytes))
+            return 0;
+    }
+
+    if ((size_t)header.entry_count > SIZE_MAX / sizeof(CACHE_ENTRY_V6))
+        return 0;
+    record_bytes = (size_t)header.entry_count * sizeof(CACHE_ENTRY_V6);
+    if ((size_t)(end - cursor) < record_bytes)
+        return 0;
+    records = cursor;
+    cursor += record_bytes;
+    names = cursor;
+    name_bytes = (size_t)header.name_chars;
+    if ((size_t)(end - names) != name_bytes)
+        return 0;
+
+    for (int i = 0; i < header.entry_count; i++) {
+        CACHE_ENTRY_V6 ce;
+        const char *name;
+        uint64_t stored_bytes;
+
+        memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
+        stored_bytes = (uint64_t)ce.name_len + 1;
+        if (ce.volume_index >= header.volume_count ||
+            ce.name_len > CACHE_MAX_STRING_LEN ||
+            ce.path_len > CACHE_MAX_STRING_LEN ||
+            ce.parent_index < CACHE_PARENT_NONE ||
+            ce.parent_index >= header.entry_count ||
+            ce.parent_index == i ||
+            name_cursor > header.name_chars ||
+            stored_bytes > header.name_chars - name_cursor ||
+            path_chars > UINT64_MAX - ce.path_len) {
+            return 0;
+        }
+        name = (const char *)(names + (size_t)name_cursor);
+        if (name[ce.name_len] != '\0' ||
+            (ce.name_len > 0 && memchr(name, '\0', ce.name_len) != NULL)) {
+            return 0;
+        }
+        name_cursor += stored_bytes;
+        path_chars += ce.path_len;
+    }
+    if (name_cursor != header.name_chars || path_chars != header.path_chars)
+        return 0;
+
+    data->entries = (INDEX_ENTRY *)calloc(
+        (size_t)data->entry_capacity, sizeof(INDEX_ENTRY));
+    data->filtered = (int *)calloc(SEARCH_MAX_RESULTS, sizeof(int));
+    if (!data->entries || !data->filtered)
+        goto fail;
+
+    name_cursor = 0;
+    for (int i = 0; i < header.entry_count; i++) {
+        CACHE_ENTRY_V6 ce;
+        INDEX_ENTRY *entry = &data->entries[i];
+
+        memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
+        entry->size = ce.size;
+        entry->creation_time = ce.creation_time;
+        entry->modification_time = ce.modification_time;
+        entry->attributes = ce.attributes;
+        entry->file_ref = ce.file_ref;
+        entry->parent_ref = ce.parent_ref;
+        entry->is_directory = (ce.flags & CACHE_ENTRY_FLAG_DIRECTORY) != 0;
+        entry->volume_index = ce.volume_index;
+        entry->metadata_loaded =
+            (ce.flags & CACHE_ENTRY_FLAG_METADATA_LOADED) != 0;
+        entry->parent_index = ce.parent_index;
+        entry->name_offset = (unsigned int)name_cursor;
+        entry->name_length = ce.name_len;
+        name_cursor += (uint64_t)ce.name_len + 1;
+    }
+
+    for (int i = 0; i < header.entry_count; i++) {
+        INDEX_ENTRY *entry = &data->entries[i];
+        int parent_index = entry->parent_index;
+        if (parent_index >= 0 &&
+            (data->entries[parent_index].volume_index != entry->volume_index ||
+             data->entries[parent_index].file_ref != entry->parent_ref)) {
+            goto fail;
+        }
+    }
+
+    data->mapped_name_offset = (size_t)(names - view);
+    data->mapped_name_bytes = name_bytes;
+    return 1;
+
+fail:
+    cache_discard_load_data(data);
+    return 0;
+}
+
+static int cache_remap_v6_names(HANDLE mapping,
+                                CACHE_LOAD_DATA *data)
+{
+    SYSTEM_INFO system_info;
+    uint64_t name_offset;
+    uint64_t aligned_offset;
+    size_t delta;
+    size_t view_bytes;
+    unsigned char *name_view;
+
+    if (!mapping || !data)
+        return 0;
+    if (data->mapped_name_bytes == 0)
+        return data->entry_count == 0;
+
+    GetSystemInfo(&system_info);
+    if (system_info.dwAllocationGranularity == 0)
+        return 0;
+    name_offset = data->mapped_name_offset;
+    aligned_offset = name_offset -
+        (name_offset % system_info.dwAllocationGranularity);
+    delta = (size_t)(name_offset - aligned_offset);
+    if (data->mapped_name_bytes > SIZE_MAX - delta)
+        return 0;
+    view_bytes = delta + data->mapped_name_bytes;
+
+    name_view = (unsigned char *)MapViewOfFile(
+        mapping, FILE_MAP_READ,
+        (DWORD)(aligned_offset >> 32), (DWORD)aligned_offset, view_bytes);
+    if (!name_view)
+        return 0;
+
+    data->names.mapped_data = (const char *)(name_view + delta);
+    data->names.mapped_size = data->mapped_name_bytes;
+    data->names.size = data->mapped_name_bytes;
+    data->names.capacity = data->mapped_name_bytes;
+    data->names.mapped_view = name_view;
+    return 1;
+}
+
 static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
 {
     INDEX_ENTRY *old_entries;
@@ -1030,8 +1176,14 @@ int cache_load_index_from_path(APP_STATE *app, const wchar_t *path)
         if (cache_load_v4_data(view, (size_t)file_size.QuadPart, &data))
             result = CACHE_LOAD_LEGACY;
     } else if (memcmp(prefix.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5)) == 0 &&
-               prefix.version == CACHE_VERSION) {
+               prefix.version == CACHE_VERSION_V5) {
         if (cache_load_v5_data(view, (size_t)file_size.QuadPart, &data)) {
+            result = CACHE_LOAD_LEGACY;
+        }
+    } else if (memcmp(prefix.magic, CACHE_MAGIC_V6, sizeof(CACHE_MAGIC_V6)) == 0 &&
+               prefix.version == CACHE_VERSION) {
+        if (cache_load_v6_data(view, (size_t)file_size.QuadPart, &data) &&
+            cache_remap_v6_names(hMap, &data)) {
             result = CACHE_LOAD_CURRENT;
         }
     }
