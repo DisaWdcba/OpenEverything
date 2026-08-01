@@ -70,6 +70,8 @@ void config_load(APP_STATE *app)
     app->column_width_path = config_read_int(path, L"Columns", L"Path", 520);
     app->column_width_size = config_read_int(path, L"Columns", L"Size", 96);
     app->column_width_modified = config_read_int(path, L"Columns", L"DateModified", 150);
+    app->column_width_attributes = config_read_int(path, L"Columns", L"Attributes", 100);
+    app->column_width_extension = config_read_int(path, L"Columns", L"Extension", 100);
     app->show_folders = config_read_int(path, L"View", L"Folders", 0) != 0;
     app->show_filters = config_read_int(path, L"View", L"Filters", 0) != 0;
     app->theme_mode = config_read_int(path, L"View", L"Theme", THEME_SYSTEM);
@@ -89,6 +91,8 @@ void config_load(APP_STATE *app)
     if (app->column_width_path < 40) app->column_width_path = 520;
     if (app->column_width_size < 40) app->column_width_size = 96;
     if (app->column_width_modified < 40) app->column_width_modified = 150;
+    if (app->column_width_attributes < 40) app->column_width_attributes = 100;
+    if (app->column_width_extension < 40) app->column_width_extension = 100;
     if (app->theme_mode < THEME_SYSTEM || app->theme_mode > THEME_DARK)
         app->theme_mode = THEME_SYSTEM;
     if (app->sidebar_width < 180 || app->sidebar_width > 600)
@@ -155,6 +159,8 @@ void config_save(APP_STATE *app)
     config_write_int(path, L"Columns", L"Path", app->column_width_path);
     config_write_int(path, L"Columns", L"Size", app->column_width_size);
     config_write_int(path, L"Columns", L"DateModified", app->column_width_modified);
+    config_write_int(path, L"Columns", L"Attributes", app->column_width_attributes);
+    config_write_int(path, L"Columns", L"Extension", app->column_width_extension);
     config_write_int(path, L"View", L"Folders", app->show_folders);
     config_write_int(path, L"View", L"Filters", app->show_filters);
     config_write_int(path, L"View", L"Theme", app->theme_mode);

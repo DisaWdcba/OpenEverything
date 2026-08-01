@@ -86,9 +86,7 @@
 #define SEARCH_MASK_EXTRA_SLOTS          24
 #define SEARCH_FOLDER_SCOPE_MAX          1024
 
-/* Entry string ownership flags */
-#define ENTRY_STRING_NAME_POOLED         0x01
-#define ENTRY_STRING_NAME_MAPPED         0x02
+#define INDEX_NAME_OFFSET_NONE           0xFFFFFFFFu
 
 /* UI constants */
 #define WC_EVERYTHING                    L"OPENEVERYTHING"
@@ -110,6 +108,14 @@
 #define WM_FOLDER_ENUM_READY             (WM_USER + 108)
 #define WM_CACHE_UPGRADE_DONE            (WM_USER + 109)
 
+/* WM_INDEX_PROGRESS values. Compatibility scan percentages are encoded above
+   100 so the UI can distinguish the slow per-record fallback from bulk MFT
+   progress without introducing another message type. */
+#define INDEX_PROGRESS_FALLBACK_BASE     1000
+#define INDEX_PROGRESS_SORTING           (-1)
+#define INDEX_PROGRESS_BUILDING          (-2)
+#define INDEX_PROGRESS_SAVING            (-3)
+
 /* Column indices */
 #define COL_NAME                         0
 #define COL_PATH                         1
@@ -117,6 +123,7 @@
 #define COL_DATE_MODIFIED                3
 #define COL_DATE_CREATED                 4
 #define COL_ATTRIBUTES                   5
+#define COL_EXTENSION                    6
 
 /* Menu command IDs */
 #define IDM_FILE_EXIT                    10001
@@ -364,30 +371,39 @@ typedef struct {
 
 #pragma pack(pop)
 
-/* Index entry structure.
- *
- * parent_index sits in the 4-byte hole the compiler already inserted after
- * `attributes`, so caching the parent's array position costs no extra memory.
- * It is a hint, not a fact: the swap-remove in index_apply_usn_changes moves
- * entries around, so it is verified against the parent's file_ref on use and
- * repaired on a miss (see index_resolve_parent_locked). -1 means "unknown".
- */
 typedef struct {
-    wchar_t *name;
+    char *data;
+    size_t size;
+    size_t capacity;
+} INDEX_NAME_POOL;
+
+/* Runtime entry. Names live in APP_STATE.name_pool as UTF-8 and are addressed
+ * by a 32-bit offset. The layout is 64 bytes on x64, down from the previous
+ * pointer-based 72-byte entry, while the pool cuts ASCII-heavy name storage in
+ * half compared with UTF-16. */
+typedef struct {
     long long size;
     long long creation_time;
     long long modification_time;
-    unsigned int attributes;
-    int parent_index;
     long long file_ref;
     long long parent_ref;
-    unsigned char string_flags;
+    unsigned int name_offset;
+    unsigned int attributes;
+    int parent_index;
+    unsigned short name_length;
     unsigned char filter_type;
     unsigned char is_directory;
     signed char volume_index;
     unsigned char metadata_loaded;
     unsigned char metadata_queued;
 } INDEX_ENTRY;
+
+typedef struct {
+    INDEX_ENTRY *entries;
+    int count;
+    int capacity;
+    INDEX_NAME_POOL names;
+} INDEX_BUILD;
 
 #define INDEX_PARENT_UNKNOWN (-1)
 
@@ -473,8 +489,8 @@ typedef struct {
     int ref_index_capacity;
     int ref_index_ready;
     volatile LONG index_revision;
-    void *entry_string_pool;
-    void *entry_cache_view;
+    INDEX_NAME_POOL name_pool;
+    size_t name_pool_live_size;
     int cache_loaded;
     CRITICAL_SECTION index_lock;
     
@@ -508,6 +524,8 @@ typedef struct {
     int column_width_path;
     int column_width_size;
     int column_width_modified;
+    int column_width_attributes;
+    int column_width_extension;
     int show_folders;
     int show_filters;
     int theme_mode;

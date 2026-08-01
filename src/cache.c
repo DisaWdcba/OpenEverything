@@ -87,10 +87,7 @@ typedef struct {
 typedef struct {
     VOLUME_INFO volumes[26];
     INDEX_ENTRY *entries;
-    wchar_t *string_pool;
-    void *mapped_view;
-    size_t mapped_name_offset;
-    size_t mapped_name_bytes;
+    INDEX_NAME_POOL names;
     int *filtered;
     int volume_count;
     int entry_count;
@@ -123,43 +120,6 @@ static int cache_ensure_dir(const wchar_t *path)
     return rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS;
 }
 
-static int cache_write_wstring(FILE *f, const wchar_t *text, unsigned int len)
-{
-    wchar_t nul = L'\0';
-    
-    if (len > 0 && fwrite(text, sizeof(wchar_t), len, f) != len)
-        return 0;
-    
-    return fwrite(&nul, sizeof(wchar_t), 1, f) == 1;
-}
-
-static wchar_t *cache_read_wstring(FILE *f, unsigned int len)
-{
-    wchar_t *text;
-    
-    if (len > 32767)
-        return NULL;
-    
-    text = (wchar_t *)calloc(len + 1, sizeof(wchar_t));
-    if (!text)
-        return NULL;
-    
-    if (len > 0 && fread(text, sizeof(wchar_t), len, f) != len) {
-        free(text);
-        return NULL;
-    }
-    
-    /* Consume the stored terminator, but force our own as a guard. */
-    wchar_t ignored;
-    if (fread(&ignored, sizeof(wchar_t), 1, f) != 1) {
-        free(text);
-        return NULL;
-    }
-    
-    text[len] = L'\0';
-    return text;
-}
-
 static void cache_free_entry_array(INDEX_ENTRY *entries, int count)
 {
     if (!entries)
@@ -181,31 +141,6 @@ static int cache_take_bytes(const unsigned char **cursor, const unsigned char *e
     return 1;
 }
 
-static wchar_t *cache_dup_wstring_from_buffer(const unsigned char **cursor,
-                                              const unsigned char *end,
-                                              unsigned int len)
-{
-    wchar_t *text;
-    size_t bytes;
-    
-    if (len > 32767)
-        return NULL;
-    
-    bytes = ((size_t)len + 1) * sizeof(wchar_t);
-    if (!cursor || !*cursor || *cursor > end || (size_t)(end - *cursor) < bytes)
-        return NULL;
-    
-    text = (wchar_t *)malloc(((size_t)len + 1) * sizeof(wchar_t));
-    if (!text)
-        return NULL;
-    
-    if (len > 0)
-        memcpy(text, *cursor, (size_t)len * sizeof(wchar_t));
-    text[len] = L'\0';
-    *cursor += bytes;
-    return text;
-}
-
 static int cache_skip_wstring(const unsigned char **cursor, const unsigned char *end,
                               unsigned int len)
 {
@@ -219,65 +154,6 @@ static int cache_skip_wstring(const unsigned char **cursor, const unsigned char 
         return 0;
     
     *cursor += bytes;
-    return 1;
-}
-
-static wchar_t *cache_copy_wstring_to_pool(const unsigned char **cursor,
-                                           const unsigned char *end,
-                                           unsigned int len,
-                                           wchar_t **pool_cursor)
-{
-    wchar_t *text;
-    size_t bytes;
-    
-    if (len > 32767 || !pool_cursor || !*pool_cursor)
-        return NULL;
-    
-    bytes = ((size_t)len + 1) * sizeof(wchar_t);
-    if (!cursor || !*cursor || *cursor > end || (size_t)(end - *cursor) < bytes)
-        return NULL;
-    
-    text = *pool_cursor;
-    if (len > 0)
-        memcpy(text, *cursor, (size_t)len * sizeof(wchar_t));
-    text[len] = L'\0';
-    
-    *pool_cursor += (size_t)len + 1;
-    *cursor += bytes;
-    return text;
-}
-
-static wchar_t *cache_copy_raw_wstring_to_pool(const unsigned char **cursor,
-                                               const unsigned char *end,
-                                               unsigned int len,
-                                               wchar_t **pool_cursor)
-{
-    wchar_t *text;
-    size_t bytes;
-
-    if (len > CACHE_MAX_STRING_LEN || !pool_cursor || !*pool_cursor)
-        return NULL;
-    if ((size_t)len > SIZE_MAX / sizeof(wchar_t))
-        return NULL;
-
-    bytes = (size_t)len * sizeof(wchar_t);
-    if (!cursor || !*cursor || *cursor > end || (size_t)(end - *cursor) < bytes)
-        return NULL;
-
-    text = *pool_cursor;
-    if (bytes > 0)
-        memcpy(text, *cursor, bytes);
-    text[len] = L'\0';
-    *pool_cursor += (size_t)len + 1;
-    *cursor += bytes;
-    return text;
-}
-
-static int cache_add_chars(size_t *total, size_t count)
-{
-    if (!total || count > SIZE_MAX - *total)
-        return 0;
-    *total += count;
     return 1;
 }
 
@@ -300,11 +176,61 @@ static void cache_discard_load_data(CACHE_LOAD_DATA *data)
     if (!data)
         return;
     cache_free_entry_array(data->entries, data->entry_count);
-    free(data->string_pool);
-    if (data->mapped_view)
-        UnmapViewOfFile(data->mapped_view);
+    index_name_pool_free(&data->names);
     free(data->filtered);
     memset(data, 0, sizeof(*data));
+}
+
+static int cache_append_wide_name(const unsigned char **cursor,
+                                  const unsigned char *end,
+                                  unsigned int length, int has_terminator,
+                                  INDEX_NAME_POOL *pool, INDEX_ENTRY *entry)
+{
+    const wchar_t *name;
+    size_t stored_chars;
+    size_t bytes;
+
+    if (!cursor || !*cursor || !pool || !entry ||
+        length > CACHE_MAX_STRING_LEN)
+        return 0;
+    stored_chars = (size_t)length + (has_terminator ? 1u : 0u);
+    if (stored_chars > SIZE_MAX / sizeof(wchar_t))
+        return 0;
+    bytes = stored_chars * sizeof(wchar_t);
+    if (*cursor > end || (size_t)(end - *cursor) < bytes)
+        return 0;
+    name = (const wchar_t *)*cursor;
+    if ((has_terminator && name[length] != L'\0') ||
+        (length > 0 && wmemchr(name, L'\0', length) != NULL)) {
+        return 0;
+    }
+    entry->name_offset = INDEX_NAME_OFFSET_NONE;
+    entry->name_length = 0;
+    if (!index_name_pool_append_wide(pool, name, length,
+                                     &entry->name_offset,
+                                     &entry->name_length)) {
+        return 0;
+    }
+    *cursor += bytes;
+    return 1;
+}
+
+static int cache_entry_name_length_locked(APP_STATE *app,
+                                          const INDEX_ENTRY *entry,
+                                          size_t *out_length)
+{
+    const char *name;
+    int chars;
+
+    if (!app || !entry || !out_length)
+        return 0;
+    name = index_entry_name_utf8_locked(app, entry);
+    chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name,
+                                entry->name_length, NULL, 0);
+    if (entry->name_length > 0 && chars == 0)
+        return 0;
+    *out_length = (size_t)chars;
+    return 1;
 }
 
 static int cache_ref_compare(const void *a, const void *b)
@@ -432,12 +358,12 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
                 size_t name_len;
                 size_t path_len;
 
-                if (!entry->name ||
-                    entry->volume_index < 0 || entry->volume_index >= volume_count) {
+                if (entry->volume_index < 0 ||
+                    entry->volume_index >= volume_count ||
+                    !cache_entry_name_length_locked(app, entry, &name_len)) {
                     ok = 0;
                     break;
                 }
-                name_len = wcslen(entry->name);
                 /* Only the length is stored, so measure the path instead of
                    building and freeing one string per entry under the lock. */
                 path_len = index_entry_path_length_locked(app, i);
@@ -503,10 +429,11 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
             for (; ok && i < batch_end; i++) {
                 INDEX_ENTRY *entry = &app->entries[i];
                 CACHE_ENTRY_V5 *ce = &record_batch[i - batch_start];
-                size_t name_len = wcslen(entry->name);
+                size_t name_len;
                 size_t path_len = path_lengths[i];
 
-                if (name_len > CACHE_MAX_STRING_LEN ||
+                if (!cache_entry_name_length_locked(app, entry, &name_len) ||
+                    name_len > CACHE_MAX_STRING_LEN ||
                     path_len > CACHE_MAX_STRING_LEN ||
                     entry->volume_index < 0 || entry->volume_index >= volume_count) {
                     ok = 0;
@@ -560,9 +487,10 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
         } else {
             for (int n = batch_start; ok && n < batch_end; n++) {
                 INDEX_ENTRY *entry = &app->entries[n];
-                size_t name_len = wcslen(entry->name);
+                size_t name_len;
 
-                if (name_len > CACHE_MAX_STRING_LEN ||
+                if (!cache_entry_name_length_locked(app, entry, &name_len) ||
+                    name_len > CACHE_MAX_STRING_LEN ||
                     batch_chars > SIZE_MAX - (name_len + 1)) {
                     ok = 0;
                     break;
@@ -591,9 +519,25 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
             } else {
                 for (int n = batch_start; n < batch_end; n++) {
                     INDEX_ENTRY *entry = &app->entries[n];
-                    size_t name_len = wcslen(entry->name);
-                    memcpy(dst, entry->name,
-                           (name_len + 1) * sizeof(wchar_t));
+                    const char *name = index_entry_name_utf8_locked(app, entry);
+                    size_t name_len;
+                    int converted;
+
+                    if (!cache_entry_name_length_locked(app, entry, &name_len)) {
+                        ok = 0;
+                        break;
+                    }
+                    converted = name_len > 0
+                        ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                              name, entry->name_length,
+                                              dst, (int)name_len)
+                        : 0;
+                    if ((name_len > 0 && converted != (int)name_len) ||
+                        name_len > INT_MAX) {
+                        ok = 0;
+                        break;
+                    }
+                    dst[name_len] = L'\0';
                     dst += name_len + 1;
                 }
             }
@@ -655,8 +599,6 @@ static int cache_load_v3_data(const unsigned char *view, size_t file_size,
     const unsigned char *entry_start;
     const unsigned char *end = view + file_size;
     CACHE_HEADER_V3 header;
-    size_t string_chars = 0;
-    wchar_t *pool_cursor;
     int ok = 1;
 
     memset(&header, 0, sizeof(header));
@@ -691,24 +633,20 @@ static int cache_load_v3_data(const unsigned char *view, size_t file_size,
         }
         if (!cache_skip_wstring(&cursor, end, ce.name_len) ||
             !cache_skip_wstring(&cursor, end, ce.path_len) ||
-            !cache_skip_wstring(&cursor, end, ce.extension_len) ||
-            !cache_add_chars(&string_chars, (size_t)ce.name_len + 1)) {
+            !cache_skip_wstring(&cursor, end, ce.extension_len)) {
             ok = 0;
             break;
         }
     }
-    if (!ok || cursor != end || string_chars > SIZE_MAX / sizeof(wchar_t))
+    if (!ok || cursor != end)
         goto fail;
 
     data->entries = (INDEX_ENTRY *)calloc(
         (size_t)data->entry_capacity, sizeof(INDEX_ENTRY));
-    data->string_pool = (wchar_t *)malloc(
-        (string_chars > 0 ? string_chars : 1) * sizeof(wchar_t));
     data->filtered = (int *)calloc(SEARCH_MAX_RESULTS, sizeof(int));
-    if (!data->entries || !data->string_pool || !data->filtered)
+    if (!data->entries || !data->filtered)
         goto fail;
 
-    pool_cursor = data->string_pool;
     cursor = entry_start;
     for (int i = 0; i < header.entry_count; i++) {
         CACHE_ENTRY_V3 ce;
@@ -717,7 +655,6 @@ static int cache_load_v3_data(const unsigned char *view, size_t file_size,
         if (!cache_take_bytes(&cursor, end, &ce, sizeof(ce)))
             goto fail;
 
-        entry->string_flags = ENTRY_STRING_NAME_POOLED;
         entry->size = ce.size;
         entry->creation_time = ce.creation_time;
         entry->modification_time = ce.modification_time;
@@ -731,16 +668,14 @@ static int cache_load_v3_data(const unsigned char *view, size_t file_size,
         entry->metadata_loaded =
             (ce.size != 0 || ce.creation_time != 0 || ce.modification_time != 0);
 
-        entry->name = cache_copy_wstring_to_pool(
-            &cursor, end, ce.name_len, &pool_cursor);
-        if (!cache_skip_wstring(&cursor, end, ce.path_len) ||
-            !cache_skip_wstring(&cursor, end, ce.extension_len) ||
-            !entry->name)
+        if (!cache_append_wide_name(&cursor, end, ce.name_len, 1,
+                                    &data->names, entry) ||
+            !cache_skip_wstring(&cursor, end, ce.path_len) ||
+            !cache_skip_wstring(&cursor, end, ce.extension_len))
             goto fail;
-        index_prepare_entry(entry);
     }
 
-    if (cursor != end || pool_cursor != data->string_pool + string_chars)
+    if (cursor != end)
         goto fail;
     return 1;
 
@@ -757,8 +692,6 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
     const unsigned char *records;
     const unsigned char *names;
     CACHE_HEADER_V4 header;
-    wchar_t *pool_cursor;
-    size_t string_chars = 0;
     uint64_t name_chars = 0;
     uint64_t path_chars = 0;
     size_t record_bytes;
@@ -822,30 +755,18 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
     if (!ok || name_chars != header.name_chars || path_chars != header.path_chars)
         return 0;
 
-    if (header.name_chars > SIZE_MAX)
-        return 0;
-    if (!cache_add_chars(&string_chars, (size_t)header.name_chars) ||
-        !cache_add_chars(&string_chars, (size_t)header.entry_count) ||
-        string_chars > SIZE_MAX / sizeof(wchar_t)) {
-        return 0;
-    }
-
     data->entries = (INDEX_ENTRY *)calloc(
         (size_t)data->entry_capacity, sizeof(INDEX_ENTRY));
-    data->string_pool = (wchar_t *)malloc(
-        (string_chars > 0 ? string_chars : 1) * sizeof(wchar_t));
     data->filtered = (int *)calloc(SEARCH_MAX_RESULTS, sizeof(int));
-    if (!data->entries || !data->string_pool || !data->filtered)
+    if (!data->entries || !data->filtered)
         goto fail;
 
-    pool_cursor = data->string_pool;
     cursor = names;
     for (int i = 0; i < header.entry_count; i++) {
         CACHE_ENTRY_V4 ce;
         INDEX_ENTRY *entry = &data->entries[i];
 
         memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
-        entry->string_flags = ENTRY_STRING_NAME_POOLED;
         entry->size = ce.size;
         entry->creation_time = ce.creation_time;
         entry->modification_time = ce.modification_time;
@@ -860,9 +781,8 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
            runtime entry is what makes path rebuilds O(depth) instead of a
            lookup per level. The loop below verifies every one of these. */
         entry->parent_index = ce.parent_index;
-        entry->name = cache_copy_raw_wstring_to_pool(
-            &cursor, end, ce.name_len, &pool_cursor);
-        if (!entry->name)
+        if (!cache_append_wide_name(&cursor, end, ce.name_len, 0,
+                                    &data->names, entry))
             goto fail;
     }
     if (cursor != end)
@@ -881,12 +801,6 @@ static int cache_load_v4_data(const unsigned char *view, size_t file_size,
             goto fail;
         }
     }
-    if (pool_cursor != data->string_pool + string_chars)
-        goto fail;
-
-    for (int i = 0; i < header.entry_count; i++)
-        index_prepare_entry(&data->entries[i]);
-
     return 1;
 
 fail:
@@ -978,13 +892,12 @@ static int cache_load_v5_data(const unsigned char *view, size_t file_size,
     if (!data->entries || !data->filtered)
         goto fail;
 
-    name_cursor = 0;
+    cursor = names;
     for (int i = 0; i < header.entry_count; i++) {
         CACHE_ENTRY_V5 ce;
         INDEX_ENTRY *entry = &data->entries[i];
 
         memcpy(&ce, records + (size_t)i * sizeof(ce), sizeof(ce));
-        entry->string_flags = ENTRY_STRING_NAME_MAPPED;
         entry->size = ce.size;
         entry->creation_time = ce.creation_time;
         entry->modification_time = ce.modification_time;
@@ -996,9 +909,9 @@ static int cache_load_v5_data(const unsigned char *view, size_t file_size,
         entry->metadata_loaded =
             (ce.flags & CACHE_ENTRY_FLAG_METADATA_LOADED) != 0;
         entry->parent_index = ce.parent_index;
-        entry->name = (wchar_t *)(names +
-            (size_t)name_cursor * sizeof(wchar_t));
-        name_cursor += (uint64_t)ce.name_len + 1;
+        if (!cache_append_wide_name(&cursor, end, ce.name_len, 1,
+                                    &data->names, entry))
+            goto fail;
     }
 
     for (int i = 0; i < header.entry_count; i++) {
@@ -1015,10 +928,6 @@ static int cache_load_v5_data(const unsigned char *view, size_t file_size,
         }
     }
 
-    for (int i = 0; i < header.entry_count; i++)
-        index_prepare_entry(&data->entries[i]);
-    data->mapped_name_offset = (size_t)(names - view);
-    data->mapped_name_bytes = name_bytes;
     return 1;
 
 fail:
@@ -1026,69 +935,18 @@ fail:
     return 0;
 }
 
-static int cache_remap_v5_names(HANDLE mapping, const unsigned char *full_view,
-                                CACHE_LOAD_DATA *data)
-{
-    SYSTEM_INFO system_info;
-    uint64_t name_offset;
-    uint64_t aligned_offset;
-    size_t delta;
-    size_t view_bytes;
-    unsigned char *name_view;
-    unsigned char *name_base;
-    const unsigned char *old_name_base;
-
-    if (!mapping || !full_view || !data)
-        return 0;
-    if (data->mapped_name_bytes == 0)
-        return data->entry_count == 0;
-
-    GetSystemInfo(&system_info);
-    if (system_info.dwAllocationGranularity == 0)
-        return 0;
-    name_offset = data->mapped_name_offset;
-    aligned_offset = name_offset -
-        (name_offset % system_info.dwAllocationGranularity);
-    delta = (size_t)(name_offset - aligned_offset);
-    if (data->mapped_name_bytes > SIZE_MAX - delta)
-        return 0;
-    view_bytes = delta + data->mapped_name_bytes;
-
-    name_view = (unsigned char *)MapViewOfFile(
-        mapping, FILE_MAP_READ,
-        (DWORD)(aligned_offset >> 32), (DWORD)aligned_offset, view_bytes);
-    if (!name_view)
-        return 0;
-
-    name_base = name_view + delta;
-    old_name_base = full_view + data->mapped_name_offset;
-    for (int i = 0; i < data->entry_count; i++) {
-        INDEX_ENTRY *entry = &data->entries[i];
-        size_t relative = (size_t)((const unsigned char *)entry->name - old_name_base);
-        if (relative >= data->mapped_name_bytes) {
-            UnmapViewOfFile(name_view);
-            return 0;
-        }
-        entry->name = (wchar_t *)(name_base + relative);
-    }
-    data->mapped_view = name_view;
-    return 1;
-}
-
 static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
 {
     INDEX_ENTRY *old_entries;
     int *old_filtered;
-    void *old_string_pool;
-    void *old_mapped_view;
+    INDEX_NAME_POOL old_names;
     int old_entry_count;
 
     EnterCriticalSection(&app->index_lock);
     old_entries = app->entries;
     old_entry_count = app->entry_count;
     old_filtered = app->filtered_indices;
-    old_string_pool = app->entry_string_pool;
-    old_mapped_view = app->entry_cache_view;
+    old_names = app->name_pool;
     index_clear_name_char_index(app);
     index_clear_filter_index(app);
     index_clear_ref_index(app);
@@ -1097,8 +955,8 @@ static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
     app->entry_count = data->entry_count;
     app->entry_capacity = data->entry_capacity;
     app->filtered_indices = data->filtered;
-    app->entry_string_pool = data->string_pool;
-    app->entry_cache_view = data->mapped_view;
+    app->name_pool = data->names;
+    app->name_pool_live_size = app->name_pool.size;
     app->filtered_count = 0;
     app->filtered_identity = 0;
     app->filtered_stale = 0;
@@ -1108,18 +966,17 @@ static void cache_install_load_data(APP_STATE *app, CACHE_LOAD_DATA *data)
     app->indexed_volume_count = data->volume_count;
     app->index_error_count = 0;
     app->cache_loaded = 1;
+    for (int i = 0; i < app->entry_count; i++)
+        index_prepare_entry(app, &app->entries[i]);
     InterlockedIncrement(&app->index_revision);
     InterlockedIncrement(&app->search_generation);
     LeaveCriticalSection(&app->index_lock);
 
     data->entries = NULL;
     data->filtered = NULL;
-    data->string_pool = NULL;
-    data->mapped_view = NULL;
+    memset(&data->names, 0, sizeof(data->names));
     cache_free_entry_array(old_entries, old_entry_count);
-    free(old_string_pool);
-    if (old_mapped_view)
-        UnmapViewOfFile(old_mapped_view);
+    index_name_pool_free(&old_names);
     free(old_filtered);
 }
 
@@ -1174,8 +1031,7 @@ int cache_load_index_from_path(APP_STATE *app, const wchar_t *path)
             result = CACHE_LOAD_LEGACY;
     } else if (memcmp(prefix.magic, CACHE_MAGIC_V5, sizeof(CACHE_MAGIC_V5)) == 0 &&
                prefix.version == CACHE_VERSION) {
-        if (cache_load_v5_data(view, (size_t)file_size.QuadPart, &data) &&
-            cache_remap_v5_names(hMap, view, &data)) {
+        if (cache_load_v5_data(view, (size_t)file_size.QuadPart, &data)) {
             result = CACHE_LOAD_CURRENT;
         }
     }

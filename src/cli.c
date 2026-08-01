@@ -245,21 +245,24 @@ static int append_entry_json(JSON_BUFFER *buffer, SEARCH_RUNTIME *runtime,
                              int entry_index)
 {
     INDEX_ENTRY *entry = &runtime->app.entries[entry_index];
+    wchar_t *name = index_duplicate_entry_name_locked(&runtime->app, entry);
     wchar_t *path = index_duplicate_entry_path_locked(&runtime->app, entry_index);
     long long modified = filetime_to_unix(entry->modification_time);
 
     if (!json_buffer_append(buffer, "{\"name\":")) goto failed;
-    if (!json_buffer_append_wstring(buffer, entry->name)) goto failed;
+    if (!json_buffer_append_wstring(buffer, name ? name : L"")) goto failed;
     if (!json_buffer_append(buffer, ",\"path\":")) goto failed;
     if (!json_buffer_append_wstring(buffer, path ? path : L"")) goto failed;
     if (!json_buffer_append_format(buffer,
             ",\"size\":%lld,\"modified\":%lld,\"directory\":%s,\"attributes\":%u}",
             entry->size, modified, entry->is_directory ? "true" : "false",
             entry->attributes)) goto failed;
+    free(name);
     free(path);
     return 1;
 
 failed:
+    free(name);
     free(path);
     return 0;
 }

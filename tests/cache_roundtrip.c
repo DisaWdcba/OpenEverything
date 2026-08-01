@@ -7,6 +7,9 @@
 
 #define TEST_QUERY_COUNT 5
 
+typedef char index_entry_must_be_64_bytes[
+    sizeof(INDEX_ENTRY) == 64 ? 1 : -1];
+
 static wchar_t g_test_config_path[MAX_PATH];
 
 typedef struct {
@@ -74,6 +77,11 @@ static INDEX_FINGERPRINT fingerprint_index(APP_STATE *app)
 
     for (int i = 0; i < app->entry_count; i++) {
         const INDEX_ENTRY *entry = &app->entries[i];
+        wchar_t *name = index_duplicate_entry_name_locked(app, entry);
+        const wchar_t *extension = L"";
+        const wchar_t *dot = name ? wcsrchr(name, L'.') : NULL;
+        if (dot && dot[1])
+            extension = dot + 1;
         hash_bytes(&result.hash, &entry->size, sizeof(entry->size));
         hash_bytes(&result.hash, &entry->creation_time, sizeof(entry->creation_time));
         hash_bytes(&result.hash, &entry->modification_time, sizeof(entry->modification_time));
@@ -84,14 +92,14 @@ static INDEX_FINGERPRINT fingerprint_index(APP_STATE *app)
         hash_bytes(&result.hash, &entry->volume_index, sizeof(entry->volume_index));
         hash_bytes(&result.hash, &entry->metadata_loaded, sizeof(entry->metadata_loaded));
         hash_bytes(&result.hash, &entry->filter_type, sizeof(entry->filter_type));
-        hash_wstring(&result.hash, entry->name, &result.name_chars);
-        hash_wstring(&result.hash, index_entry_extension(entry),
-                     &result.extension_chars);
+        hash_wstring(&result.hash, name, &result.name_chars);
+        hash_wstring(&result.hash, extension, &result.extension_chars);
         {
             wchar_t *path = index_duplicate_entry_path_locked(app, i);
             hash_wstring(&result.hash, path, &result.path_chars);
             free(path);
         }
+        free(name);
     }
     return result;
 }
@@ -187,17 +195,13 @@ static int add_ref_test_entry(APP_STATE *app, const wchar_t *name,
     INDEX_ENTRY entry;
 
     memset(&entry, 0, sizeof(entry));
-    entry.name = _wcsdup(name);
-    if (!entry.name)
-        return 0;
     entry.file_ref = file_ref;
     entry.parent_ref = parent_ref;
     entry.volume_index = 0;
     entry.is_directory = (unsigned char)(is_directory != 0);
     entry.attributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
     entry.parent_index = INDEX_PARENT_UNKNOWN;
-    if (!index_add_entry(app, &entry)) {
-        index_free_entry(&entry);
+    if (!index_add_entry(app, &entry, name)) {
         return 0;
     }
     return 1;
@@ -453,15 +457,41 @@ static int run_memory_probe(const wchar_t *directory)
 {
     APP_STATE app;
     PROCESS_MEMORY_COUNTERS_EX counters;
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    double sort_ms;
+    double compact_ms;
+    double filter_ms;
+    double ref_ms;
+    double char_ms;
     int result;
 
     set_cache_directory(directory);
     index_init(&app);
     result = cache_load_index(&app);
-    if (result == CACHE_LOAD_FAILED ||
-        !index_build_filter_index(&app) ||
-        !index_build_ref_index(&app) ||
-        !index_build_name_char_index(&app)) {
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    index_sort_entries_by_name(&app);
+    QueryPerformanceCounter(&end);
+    sort_ms = elapsed_milliseconds(start, end, frequency);
+    QueryPerformanceCounter(&start);
+    result = result != CACHE_LOAD_FAILED && index_compact_entry_names(&app);
+    QueryPerformanceCounter(&end);
+    compact_ms = elapsed_milliseconds(start, end, frequency);
+    QueryPerformanceCounter(&start);
+    result = result && index_build_filter_index(&app);
+    QueryPerformanceCounter(&end);
+    filter_ms = elapsed_milliseconds(start, end, frequency);
+    QueryPerformanceCounter(&start);
+    result = result && index_build_ref_index(&app);
+    QueryPerformanceCounter(&end);
+    ref_ms = elapsed_milliseconds(start, end, frequency);
+    QueryPerformanceCounter(&start);
+    result = result && index_build_name_char_index(&app);
+    QueryPerformanceCounter(&end);
+    char_ms = elapsed_milliseconds(start, end, frequency);
+    if (!result) {
         destroy_app(&app);
         return 1;
     }
@@ -477,6 +507,11 @@ static int run_memory_probe(const wchar_t *directory)
     wprintf(L"entry_size=%zu\n", sizeof(INDEX_ENTRY));
     wprintf(L"entry_capacity=%d\n", app.entry_capacity);
     wprintf(L"ref_capacity=%d\n", app.ref_index_capacity);
+    wprintf(L"sort_ms=%.3f\n", sort_ms);
+    wprintf(L"compact_ms=%.3f\n", compact_ms);
+    wprintf(L"filter_ms=%.3f\n", filter_ms);
+    wprintf(L"ref_ms=%.3f\n", ref_ms);
+    wprintf(L"char_ms=%.3f\n", char_ms);
     wprintf(L"working_set_mb=%.2f\n",
             (double)counters.WorkingSetSize / (1024.0 * 1024.0));
     wprintf(L"private_mb=%.2f\n",

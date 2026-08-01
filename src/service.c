@@ -380,8 +380,9 @@ static int service_rebuild_index(APP_STATE *app, const wchar_t *index_path)
 
     for (int i = 0; i < app->volume_count; i++) {
         HANDLE volume;
-        INDEX_ENTRY *entries = NULL;
-        int entry_count = 0;
+        INDEX_BUILD build;
+
+        index_build_init(&build);
 
         if (WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0)
             return 0;
@@ -392,23 +393,21 @@ static int service_rebuild_index(APP_STATE *app, const wchar_t *index_path)
             failed_volumes++;
             continue;
         }
-        if (ntfs_read_usn_index(volume, &entries, &entry_count, i, NULL) > 0 ||
-            ntfs_read_mft(volume, &entries, &entry_count, i, NULL) > 0) {
+        if (ntfs_read_mft(volume, &build, i, NULL) > 0 ||
+            ntfs_read_usn_index(volume, &build, i, NULL) > 0) {
             indexed_volumes++;
         } else {
             failed_volumes++;
         }
         ntfs_update_volume_usn_info(volume, &app->volumes[i]);
         ntfs_close_volume(volume);
-        if (!index_add_entries(app, entries, entry_count)) {
-            for (int n = 0; n < entry_count; n++)
-                index_free_entry(&entries[n]);
-            free(entries);
+        if (!index_add_entries(app, &build)) {
+            index_build_free(&build);
             service_set_runtime_state(OE_SERVICE_STATE_ERROR,
                                       ERROR_NOT_ENOUGH_MEMORY);
             return 0;
         }
-        free(entries);
+        index_build_free(&build);
     }
 
     app->indexed_volume_count = indexed_volumes;

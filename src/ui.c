@@ -675,7 +675,7 @@ static int ui_copy_entry_snapshot(APP_STATE *app, int row, wchar_t **out_name,
     if (entry) {
         int entry_index = (int)(entry - app->entries);
         if (out_name)
-            *out_name = _wcsdup(entry->name ? entry->name : L"");
+            *out_name = index_duplicate_entry_name_locked(app, entry);
         if (out_path)
             *out_path = index_duplicate_entry_path_locked(app, entry_index);
         if (out_is_dir)
@@ -1333,30 +1333,38 @@ static DWORD WINAPI reindex_thread_proc(void *p)
             continue;
         }
         
-        INDEX_ENTRY *vol_entries = NULL;
-        int vol_count = 0;
-        if (ntfs_read_usn_index(hVol, &vol_entries, &vol_count, v, c->hwnd) > 0 ||
-            ntfs_read_mft(hVol, &vol_entries, &vol_count, v, c->hwnd) > 0)
+        INDEX_BUILD build;
+        index_build_init(&build);
+        if (ntfs_read_mft(hVol, &build, v, c->hwnd) > 0 ||
+            ntfs_read_usn_index(hVol, &build, v, c->hwnd) > 0)
             indexed_volumes++;
         else
             failed_volumes++;
         ntfs_update_volume_usn_info(hVol, &a->volumes[v]);
         ntfs_close_volume(hVol);
         
-        index_add_entries(a, vol_entries, vol_count);
-        free(vol_entries);
+        if (!index_add_entries(a, &build))
+            failed_volumes++;
+        index_build_free(&build);
     }
     
     a->indexed_volume_count = indexed_volumes;
     a->index_error_count = failed_volumes;
+    PostMessageW(c->hwnd, WM_INDEX_PROGRESS,
+                 (WPARAM)(INT_PTR)INDEX_PROGRESS_SORTING, 0);
     index_build_paths(a);
     index_sort_entries_by_name(a);
     index_compact_entry_names(a);
+    PostMessageW(c->hwnd, WM_INDEX_PROGRESS,
+                 (WPARAM)(INT_PTR)INDEX_PROGRESS_BUILDING, 0);
     index_build_filter_index(a);
     index_build_ref_index(a);
     index_build_name_char_index(a);
-    if (a->entry_count > 0)
+    if (a->entry_count > 0) {
+        PostMessageW(c->hwnd, WM_INDEX_PROGRESS,
+                     (WPARAM)(INT_PTR)INDEX_PROGRESS_SAVING, 0);
         cache_save_index(a);
+    }
     PostMessageW(c->hwnd, WM_INDEX_DONE, 0, 0);
     InterlockedExchange(&g_reindexing, 0);
     free(c);
@@ -2301,10 +2309,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         col.pszText = L"Size";          col.cx = ui_scale(app->column_width_size);     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
         col.pszText = L"Date Modified"; col.cx = ui_scale(app->column_width_modified); col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
         col.pszText = L"Date Created";  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
-        col.pszText = L"Attributes";    col.cx = 0;   col.iSubItem = 5; ListView_InsertColumn(g_hwndList, 5, &col);
-        
-        /* Add extension column (hidden) */
-        col.pszText = L"Extension";     col.cx = 0;   col.iSubItem = 6; ListView_InsertColumn(g_hwndList, 6, &col);
+        col.pszText = L"Attributes";    col.cx = ui_scale(app->column_width_attributes); col.iSubItem = COL_ATTRIBUTES; ListView_InsertColumn(g_hwndList, COL_ATTRIBUTES, &col);
+        col.pszText = L"Extension";     col.cx = ui_scale(app->column_width_extension);  col.iSubItem = COL_EXTENSION;  ListView_InsertColumn(g_hwndList, COL_EXTENSION, &col);
         ui_update_sort_indicator(g_hwndList, app->query.sort_column,
                                  app->query.sort_ascending);
         ui_hide_horizontal_scrollbar(g_hwndList);
@@ -2509,20 +2515,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         {
             int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
             if (sel >= 0 && sel < app->filtered_count) {
-                INDEX_ENTRY *e = ui_entry_from_row(app, sel);
-                if (!e) break;
-                if (OpenClipboard(hwnd)) {
-                    EmptyClipboard();
-                    size_t len = (wcslen(e->name) + 1) * sizeof(wchar_t);
-                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-                    if (hMem) {
-                        wchar_t *p = (wchar_t *)GlobalLock(hMem);
-                        wcscpy_s(p, len / sizeof(wchar_t), e->name);
-                        GlobalUnlock(hMem);
-                        SetClipboardData(CF_UNICODETEXT, hMem);
-                    }
-                    CloseClipboard();
-                }
+                wchar_t *name = NULL;
+                if (ui_copy_entry_snapshot(app, sel, &name, NULL, NULL))
+                    ui_copy_text_to_clipboard(hwnd, name);
+                free(name);
             }
             break;
         }
@@ -2715,7 +2711,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                     int entry_index = (int)(e - app->entries);
                     has_entry = 1;
                     icon_is_dir = e->is_directory;
-                    wcsncpy_s(icon_ext, 64, index_entry_extension(e), _TRUNCATE);
+                    index_copy_entry_extension_locked(app, e, icon_ext, 64);
                     
                     if (di->item.mask & LVIF_TEXT) {
                         switch (di->item.iSubItem) {
@@ -2723,8 +2719,14 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                             /* Truncate rather than trip the invalid parameter
                                handler: a name longer than the cell buffer would
                                otherwise terminate the process mid-paint. */
-                            wcsncpy_s(text_buf, 512, e->name ? e->name : L"",
-                                      _TRUNCATE);
+                            if (!index_copy_entry_name_locked(app, e,
+                                                              text_buf, 512)) {
+                                wchar_t *full_name =
+                                    index_duplicate_entry_name_locked(app, e);
+                                wcsncpy_s(text_buf, 512,
+                                          full_name ? full_name : L"", _TRUNCATE);
+                                free(full_name);
+                            }
                             di->item.pszText = text_buf;
                             break;
                         case COL_PATH:
@@ -2748,6 +2750,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                             break;
                         case COL_ATTRIBUTES:
                             ntfs_format_attributes(text_buf, 512, e->attributes);
+                            di->item.pszText = text_buf;
+                            break;
+                        case COL_EXTENSION:
+                            index_copy_entry_extension_locked(app, e,
+                                                              text_buf, 512);
                             di->item.pszText = text_buf;
                             break;
                         default:
@@ -3031,10 +3038,21 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         wchar_t label[16] = L"";
         if (vol >= 0 && vol < app->volume_count)
             wcscpy_s(label, 16, app->volumes[vol].drive_letter);
-        if (pct > 0)
+        if (pct >= INDEX_PROGRESS_FALLBACK_BASE &&
+            pct <= INDEX_PROGRESS_FALLBACK_BASE + 100) {
+            swprintf_s(buf, 256, L"Indexing %s (compatibility scan) %d%%",
+                       label, pct - INDEX_PROGRESS_FALLBACK_BASE);
+        } else if (pct == INDEX_PROGRESS_SORTING) {
+            wcscpy_s(buf, 256, L"Sorting file names...");
+        } else if (pct == INDEX_PROGRESS_BUILDING) {
+            wcscpy_s(buf, 256, L"Building search index...");
+        } else if (pct == INDEX_PROGRESS_SAVING) {
+            wcscpy_s(buf, 256, L"Saving index...");
+        } else if (pct > 0) {
             swprintf_s(buf, 256, L"Indexing %s %d%%", label, pct);
-        else
+        } else {
             swprintf_s(buf, 256, L"Indexing %s", label);
+        }
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)buf);
         return 0;
     }
@@ -3127,6 +3145,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             app->column_width_path = ui_unscale(ListView_GetColumnWidth(g_hwndList, 1));
             app->column_width_size = ui_unscale(ListView_GetColumnWidth(g_hwndList, 2));
             app->column_width_modified = ui_unscale(ListView_GetColumnWidth(g_hwndList, 3));
+            app->column_width_attributes = ui_unscale(
+                ListView_GetColumnWidth(g_hwndList, COL_ATTRIBUTES));
+            app->column_width_extension = ui_unscale(
+                ListView_GetColumnWidth(g_hwndList, COL_EXTENSION));
         }
         {
             /* GetWindowPlacement reports the restored rect even when the window

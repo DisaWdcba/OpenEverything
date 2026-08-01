@@ -242,7 +242,7 @@ static int compare_entries_for_query(APP_STATE *app, int ia, int ib, int column)
             break;
         case COL_NAME:
         default:
-            result = _wcsicmp(a->name ? a->name : L"", b->name ? b->name : L"");
+            result = index_compare_entry_names_locked(app, a, b);
             break;
     }
     if (result == 0)
@@ -356,6 +356,8 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
 {
     INDEX_ENTRY *entry;
     wchar_t *path = NULL;
+    wchar_t *owned_name = NULL;
+    wchar_t name_buffer[512];
     const wchar_t *target;
     int matched = 0;
 
@@ -373,7 +375,16 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
         free(path);
         return 0;
     }
-    target = query->match_path ? path : entry->name;
+    if (query->match_path) {
+        target = path;
+    } else if (index_copy_entry_name_locked(app, entry, name_buffer,
+                                            sizeof(name_buffer) /
+                                                sizeof(name_buffer[0]))) {
+        target = name_buffer;
+    } else {
+        owned_name = index_duplicate_entry_name_locked(app, entry);
+        target = owned_name;
+    }
     if (!query->text[0]) {
         matched = 1;
         goto done;
@@ -383,8 +394,14 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
     /* Handle special type filters */
     if (query->ext_filter_offset >= 0) {
         const wchar_t *exts = query->text + query->ext_filter_offset;
-        const wchar_t *entry_ext = index_entry_extension(entry);
+        wchar_t entry_ext[512];
         wchar_t exts_copy[512];
+
+        if (!index_copy_entry_extension_locked(
+                app, entry, entry_ext,
+                sizeof(entry_ext) / sizeof(entry_ext[0]))) {
+            goto done;
+        }
 
         wcsncpy_s(exts_copy, 512, exts, _TRUNCATE);
 
@@ -425,6 +442,7 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
     matched = match_wildcard(target, query->text, query->match_case);
 
 done:
+    free(owned_name);
     free(path);
     return matched;
 }
