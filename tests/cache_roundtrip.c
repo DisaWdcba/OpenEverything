@@ -286,6 +286,164 @@ static int run_ref_index_mutation_probe(void)
     return ok ? 0 : 1;
 }
 
+static int add_volume_test_entry(APP_STATE *app, int volume_index,
+                                 const wchar_t *name, long long file_ref,
+                                 int is_directory)
+{
+    INDEX_ENTRY entry;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.file_ref = file_ref;
+    entry.parent_ref = NTFS_ROOT_FRN;
+    entry.volume_index = (signed char)volume_index;
+    entry.is_directory = (unsigned char)(is_directory != 0);
+    entry.attributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY
+                                    : FILE_ATTRIBUTE_NORMAL;
+    entry.parent_index = INDEX_PARENT_UNKNOWN;
+    return index_add_entry(app, &entry, name);
+}
+
+static int add_scope_test_entry(APP_STATE *app, int volume_index,
+                                const wchar_t *name, long long file_ref,
+                                long long parent_ref, int is_directory)
+{
+    INDEX_ENTRY entry;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.file_ref = file_ref;
+    entry.parent_ref = parent_ref;
+    entry.volume_index = (signed char)volume_index;
+    entry.is_directory = (unsigned char)(is_directory != 0);
+    entry.attributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY
+                                    : FILE_ATTRIBUTE_NORMAL;
+    entry.parent_index = INDEX_PARENT_UNKNOWN;
+    return index_add_entry(app, &entry, name);
+}
+
+static int volume_results_equal(const APP_STATE *app, const int *indices,
+                                int count, int volume_index)
+{
+    for (int i = 0; i < count; i++) {
+        int index = indices[i];
+        if (index < 0 || index >= app->entry_count ||
+            app->entries[index].volume_index != volume_index ||
+            app->entries[index].file_ref == NTFS_ROOT_FRN) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int run_volume_index_probe(void)
+{
+    APP_STATE app;
+    SEARCH_QUERY query;
+    int results[16];
+    int count;
+    int ok;
+
+    index_init(&app);
+    app.volume_count = 3;
+    wcscpy_s(app.volumes[0].drive_letter, 4, L"C:\\");
+    wcscpy_s(app.volumes[1].drive_letter, 4, L"D:\\");
+    wcscpy_s(app.volumes[2].drive_letter, 4, L"E:\\");
+
+    ok = add_volume_test_entry(&app, 0, L".", NTFS_ROOT_FRN, 1) &&
+         add_volume_test_entry(&app, 1, L".", NTFS_ROOT_FRN, 1) &&
+         add_volume_test_entry(&app, 2, L".", NTFS_ROOT_FRN, 1) &&
+         add_volume_test_entry(&app, 0, L"alpha.txt", 101, 0) &&
+         add_volume_test_entry(&app, 2, L"bravo.txt", 301, 0) &&
+         add_volume_test_entry(&app, 1, L"charlie.exe", 201, 0) &&
+         add_volume_test_entry(&app, 0, L"delta.exe", 102, 0) &&
+         add_volume_test_entry(&app, 1, L"echo.txt", 202, 0) &&
+         add_volume_test_entry(&app, 2, L"foxtrot.exe", 302, 0) &&
+         index_build_filter_index(&app) && app.volume_index_ready &&
+         app.volume_counts[0] == 3 && app.volume_counts[1] == 3 &&
+         app.volume_counts[2] == 3 && app.volume_indices[0] == NULL &&
+         app.volume_indices[1] != NULL && app.volume_indices[2] != NULL;
+
+    memset(&query, 0, sizeof(query));
+    query.filter_id = FILTER_EVERYTHING;
+    query.include_subfolders = 1;
+    query.sort_column = COL_NAME;
+    query.sort_ascending = 1;
+    wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX, L"D:\\");
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 2 && volume_results_equal(&app, results, count, 1);
+
+    query.filter_id = FILTER_DOCUMENT;
+    wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX, L"E:\\");
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 1 && volume_results_equal(&app, results, count, 2);
+
+    if (ok)
+        ok = add_volume_test_entry(&app, 1, L"golf.txt", 203, 0) &&
+             !app.volume_index_ready && index_build_filter_index(&app) &&
+             app.volume_counts[1] == 4;
+    query.filter_id = FILTER_EVERYTHING;
+    wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX, L"D:\\");
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 3 && volume_results_equal(&app, results, count, 1);
+
+    wprintf(L"volume_index_search=%ls\n", ok ? L"PASS" : L"FAIL");
+    destroy_app(&app);
+    return ok ? 0 : 1;
+}
+
+static int run_scope_index_probe(void)
+{
+    APP_STATE app;
+    SEARCH_QUERY query;
+    int results[16];
+    int count;
+    int ok;
+
+    index_init(&app);
+    app.volume_count = 1;
+    wcscpy_s(app.volumes[0].drive_letter, 4, L"D:\\");
+    ok = add_scope_test_entry(&app, 0, L".", 5, 5, 1) &&
+         add_scope_test_entry(&app, 0, L"level1", 101, 5, 1) &&
+         add_scope_test_entry(&app, 0, L"level2", 102, 101, 1) &&
+         add_scope_test_entry(&app, 0, L"level3", 103, 102, 1) &&
+         add_scope_test_entry(&app, 0, L"level4", 104, 103, 1) &&
+         add_scope_test_entry(&app, 0, L"level5", 105, 104, 1) &&
+         add_scope_test_entry(&app, 0, L"deep.txt", 106, 105, 0) &&
+         add_scope_test_entry(&app, 0, L"child", 107, 105, 1) &&
+         add_scope_test_entry(&app, 0, L"child.txt", 108, 107, 0) &&
+         add_scope_test_entry(&app, 0, L"outside.txt", 109, 104, 0) &&
+         index_build_ref_index(&app) && index_build_filter_index(&app);
+
+    memset(&query, 0, sizeof(query));
+    query.filter_id = FILTER_EVERYTHING;
+    query.include_subfolders = 1;
+    query.sort_column = COL_NAME;
+    query.sort_ascending = 1;
+    wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX,
+             L"D:\\level1\\level2\\level3\\level4\\level5");
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 3 && app.scope_index_capacity <= 256 &&
+         volume_results_equal(&app, results, count, 0);
+
+    query.include_subfolders = 0;
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 2 && volume_results_equal(&app, results, count, 0);
+
+    query.include_subfolders = 1;
+    query.filter_id = FILTER_DOCUMENT;
+    search_prepare_query(&query);
+    count = ok ? search_execute_to_buffer(&app, &query, results, 16) : 0;
+    ok = ok && count == 2 && volume_results_equal(&app, results, count, 0);
+
+    wprintf(L"nested_scope_search=%ls\n", ok ? L"PASS" : L"FAIL");
+    destroy_app(&app);
+    return ok ? 0 : 1;
+}
+
 static int fingerprints_equal(const INDEX_FINGERPRINT *a,
                               const INDEX_FINGERPRINT *b)
 {
@@ -553,6 +711,156 @@ static int run_query_probe(const wchar_t *directory)
     return 0;
 }
 
+static double median_three(double values[3])
+{
+    if (values[0] > values[1]) {
+        double swap = values[0]; values[0] = values[1]; values[1] = swap;
+    }
+    if (values[1] > values[2]) {
+        double swap = values[1]; values[1] = values[2]; values[2] = swap;
+    }
+    if (values[0] > values[1]) {
+        double swap = values[0]; values[0] = values[1]; values[1] = swap;
+    }
+    return values[1];
+}
+
+static int run_volume_search_probe(const wchar_t *directory)
+{
+    APP_STATE app;
+    SEARCH_QUERY query;
+    LARGE_INTEGER frequency;
+    int *indices;
+    int result;
+
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    if (result == CACHE_LOAD_FAILED || !index_build_filter_index(&app)) {
+        destroy_app(&app);
+        return 1;
+    }
+    indices = (int *)malloc(SEARCH_MAX_RESULTS * sizeof(*indices));
+    if (!indices) {
+        destroy_app(&app);
+        return 1;
+    }
+    QueryPerformanceFrequency(&frequency);
+
+    for (int volume = 0; volume < app.volume_count && volume < 26; volume++) {
+        static const int filters[] = { FILTER_EVERYTHING, FILTER_DOCUMENT };
+        for (int filter_index = 0;
+             filter_index < (int)(sizeof(filters) / sizeof(filters[0]));
+             filter_index++) {
+            double samples[3];
+            int count = 0;
+
+            memset(&query, 0, sizeof(query));
+            query.filter_id = filters[filter_index];
+            query.include_subfolders = 1;
+            query.sort_column = COL_NAME;
+            query.sort_ascending = 1;
+            wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX,
+                     app.volumes[volume].drive_letter);
+            search_prepare_query(&query);
+            for (int sample = 0; sample < 3; sample++) {
+                LARGE_INTEGER start;
+                LARGE_INTEGER end;
+                QueryPerformanceCounter(&start);
+                count = search_execute_to_buffer(
+                    &app, &query, indices, SEARCH_MAX_RESULTS);
+                QueryPerformanceCounter(&end);
+                samples[sample] = elapsed_milliseconds(start, end, frequency);
+            }
+            wprintf(L"volume_%lc_%ls_count=%d\n",
+                    app.volumes[volume].drive_letter[0],
+                    filters[filter_index] == FILTER_EVERYTHING
+                        ? L"everything" : L"document",
+                    count);
+            wprintf(L"volume_%lc_%ls_median_ms=%.3f\n",
+                    app.volumes[volume].drive_letter[0],
+                    filters[filter_index] == FILTER_EVERYTHING
+                        ? L"everything" : L"document",
+                    median_three(samples));
+        }
+    }
+
+    free(indices);
+    destroy_app(&app);
+    return 0;
+}
+
+static int run_folder_search_probe(const wchar_t *directory,
+                                   const wchar_t *folder)
+{
+    APP_STATE app;
+    SEARCH_QUERY query;
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    double warm_samples[3];
+    double filter_samples[3];
+    int *indices;
+    int count = 0;
+    int result;
+
+    if (wcslen(folder) >= SEARCH_FOLDER_SCOPE_MAX)
+        return 1;
+    set_cache_directory(directory);
+    index_init(&app);
+    result = cache_load_index(&app);
+    if (result == CACHE_LOAD_FAILED || !index_build_filter_index(&app) ||
+        !index_build_ref_index(&app)) {
+        destroy_app(&app);
+        return 1;
+    }
+    indices = (int *)malloc(SEARCH_MAX_RESULTS * sizeof(*indices));
+    if (!indices) {
+        destroy_app(&app);
+        return 1;
+    }
+    memset(&query, 0, sizeof(query));
+    query.filter_id = FILTER_EVERYTHING;
+    query.include_subfolders = 1;
+    query.sort_column = COL_NAME;
+    query.sort_ascending = 1;
+    wcscpy_s(query.folder_scope, SEARCH_FOLDER_SCOPE_MAX, folder);
+    search_prepare_query(&query);
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    count = search_execute_to_buffer(&app, &query, indices, SEARCH_MAX_RESULTS);
+    QueryPerformanceCounter(&end);
+    wprintf(L"folder_scope_cold_count=%d\n", count);
+    wprintf(L"folder_scope_cold_ms=%.3f\n",
+            elapsed_milliseconds(start, end, frequency));
+    wprintf(L"folder_scope_cache_capacity=%d\n", app.scope_index_capacity);
+    for (int sample = 0; sample < 3; sample++) {
+        QueryPerformanceCounter(&start);
+        count = search_execute_to_buffer(&app, &query, indices, SEARCH_MAX_RESULTS);
+        QueryPerformanceCounter(&end);
+        warm_samples[sample] = elapsed_milliseconds(start, end, frequency);
+    }
+    wprintf(L"folder_scope_warm_count=%d\n", count);
+    wprintf(L"folder_scope_warm_median_ms=%.3f\n",
+            median_three(warm_samples));
+
+    query.filter_id = FILTER_DOCUMENT;
+    search_prepare_query(&query);
+    for (int sample = 0; sample < 3; sample++) {
+        QueryPerformanceCounter(&start);
+        count = search_execute_to_buffer(&app, &query, indices, SEARCH_MAX_RESULTS);
+        QueryPerformanceCounter(&end);
+        filter_samples[sample] = elapsed_milliseconds(start, end, frequency);
+    }
+    wprintf(L"folder_scope_document_count=%d\n", count);
+    wprintf(L"folder_scope_document_median_ms=%.3f\n",
+            median_three(filter_samples));
+
+    free(indices);
+    destroy_app(&app);
+    return 0;
+}
+
 static int run_leak_probe(const wchar_t *directory)
 {
     APP_STATE app;
@@ -624,10 +932,18 @@ int wmain(int argc, wchar_t **argv)
         return run_memory_probe(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"--query-probe") == 0)
         return run_query_probe(argv[2]);
+    if (argc == 3 && wcscmp(argv[1], L"--volume-search-probe") == 0)
+        return run_volume_search_probe(argv[2]);
+    if (argc == 4 && wcscmp(argv[1], L"--folder-search-probe") == 0)
+        return run_folder_search_probe(argv[2], argv[3]);
     if (argc == 3 && wcscmp(argv[1], L"--leak-probe") == 0)
         return run_leak_probe(argv[2]);
     if (argc == 2 && wcscmp(argv[1], L"--ref-index-probe") == 0)
         return run_ref_index_mutation_probe();
+    if (argc == 2 && wcscmp(argv[1], L"--volume-index-probe") == 0)
+        return run_volume_index_probe();
+    if (argc == 2 && wcscmp(argv[1], L"--scope-index-probe") == 0)
+        return run_scope_index_probe();
 
     if (argc != 2) {
         fwprintf(stderr,
@@ -635,7 +951,11 @@ int wmain(int argc, wchar_t **argv)
                  L"       cache_roundtrip.exe --benchmark V3_DIRECTORY V4_DIRECTORY\n"
                  L"       cache_roundtrip.exe --search-benchmark V3_DIRECTORY V4_DIRECTORY\n"
                  L"       cache_roundtrip.exe --probe DIRECTORY EXPECTED_RESULT\n"
-                 L"       cache_roundtrip.exe --ref-index-probe\n");
+                 L"       cache_roundtrip.exe --volume-search-probe DIRECTORY\n"
+                 L"       cache_roundtrip.exe --folder-search-probe DIRECTORY FOLDER\n"
+                 L"       cache_roundtrip.exe --ref-index-probe\n"
+                 L"       cache_roundtrip.exe --volume-index-probe\n"
+                 L"       cache_roundtrip.exe --scope-index-probe\n");
         return 2;
     }
 

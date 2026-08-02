@@ -537,7 +537,7 @@ static int index_find_parent_locked(APP_STATE *app, int volume_index,
    a path walk into an array access; without it every step falls back to
    index_find_parent_locked, which degrades to a full scan whenever the ref
    index is not built. The caller must hold index_lock. */
-static int index_resolve_parent_locked(APP_STATE *app, INDEX_ENTRY *entry)
+int index_resolve_parent_locked(APP_STATE *app, INDEX_ENTRY *entry)
 {
     int hint = entry->parent_index;
     int found;
@@ -1145,6 +1145,25 @@ void index_clear_filter_index(APP_STATE *app)
         app->filter_counts[filter] = 0;
     }
     app->filter_index_ready = 0;
+
+    free(app->volume_index_pool);
+    app->volume_index_pool = NULL;
+    for (int volume = 0; volume < 26; volume++) {
+        app->volume_indices[volume] = NULL;
+        app->volume_counts[volume] = 0;
+    }
+    app->volume_index_ready = 0;
+
+    free(app->scope_index_pool);
+    app->scope_index_pool = NULL;
+    app->scope_index_count = 0;
+    app->scope_index_capacity = 0;
+    app->scope_index_target = -1;
+    app->scope_index_volume = -1;
+    app->scope_index_include_subfolders = 0;
+    app->scope_index_revision = 0;
+    app->scope_index_path[0] = L'\0';
+    app->scope_index_ready = 0;
 }
 
 static int index_compare_filter_indices(void *context,
@@ -1197,10 +1216,20 @@ int index_build_filter_index(APP_STATE *app)
     int counts[FILTER_COUNT] = {0};
     int offsets[FILTER_COUNT] = {0};
     int cursors[FILTER_COUNT] = {0};
+    int volume_counts[26] = {0};
+    int volume_directory_counts[26] = {0};
+    int volume_offsets[26] = {0};
+    int volume_directory_cursors[26] = {0};
+    int volume_file_cursors[26] = {0};
     unsigned char *filter_types = NULL;
+    unsigned char *volume_types = NULL;
     int *pool = NULL;
+    int *volume_pool = NULL;
     int total = 0;
+    int volume_total = 0;
     int entry_count;
+    int volume_count;
+    int largest_volume = -1;
     LONG revision;
 
     if (!app)
@@ -1208,20 +1237,32 @@ int index_build_filter_index(APP_STATE *app)
 
     EnterCriticalSection(&app->index_lock);
     entry_count = app->entry_count;
+    volume_count = app->volume_count;
     revision = app->index_revision;
     if (entry_count > 0) {
         filter_types = (unsigned char *)malloc((size_t)entry_count);
-        if (!filter_types) {
+        volume_types = (unsigned char *)malloc((size_t)entry_count);
+        if (!filter_types || !volume_types) {
             LeaveCriticalSection(&app->index_lock);
             free(filter_types);
+            free(volume_types);
             return 0;
         }
     }
     for (int i = 0; i < entry_count; i++) {
         int filter = app->entries[i].filter_type;
+        int volume = app->entries[i].volume_index;
         filter_types[i] = (unsigned char)filter;
+        volume_types[i] = 0xff;
         if (filter > FILTER_EVERYTHING && filter < FILTER_COUNT)
             counts[filter]++;
+        if (volume >= 0 && volume < volume_count && volume < 26) {
+            volume_types[i] = (unsigned char)(
+                volume + (app->entries[i].is_directory ? 0 : 26));
+            volume_counts[volume]++;
+            if (app->entries[i].is_directory)
+                volume_directory_counts[volume]++;
+        }
     }
     LeaveCriticalSection(&app->index_lock);
 
@@ -1235,15 +1276,50 @@ int index_build_filter_index(APP_STATE *app)
         pool = (int *)malloc((size_t)total * sizeof(*pool));
         if (!pool) {
             free(filter_types);
+            free(volume_types);
+            return 0;
+        }
+    }
+    for (int volume = 0; volume < volume_count && volume < 26; volume++) {
+        if (largest_volume < 0 ||
+            volume_counts[volume] > volume_counts[largest_volume]) {
+            largest_volume = volume;
+        }
+    }
+    for (int volume = 0; volume < volume_count && volume < 26; volume++) {
+        if (volume == largest_volume)
+            continue;
+        volume_offsets[volume] = volume_total;
+        volume_directory_cursors[volume] = volume_total;
+        volume_file_cursors[volume] =
+            volume_total + volume_directory_counts[volume];
+        volume_total += volume_counts[volume];
+    }
+    if (volume_total > 0) {
+        volume_pool = (int *)malloc((size_t)volume_total * sizeof(*volume_pool));
+        if (!volume_pool) {
+            free(filter_types);
+            free(volume_types);
+            free(pool);
             return 0;
         }
     }
     for (int i = 0; i < entry_count; i++) {
         int filter = filter_types[i];
+        int volume_key = volume_types[i];
         if (filter > FILTER_EVERYTHING && filter < FILTER_COUNT)
             pool[cursors[filter]++] = i;
+        if (volume_key < 26) {
+            if (volume_key != largest_volume)
+                volume_pool[volume_directory_cursors[volume_key]++] = i;
+        } else if (volume_key < 52) {
+            int volume = volume_key - 26;
+            if (volume != largest_volume)
+                volume_pool[volume_file_cursors[volume]++] = i;
+        }
     }
     free(filter_types);
+    free(volume_types);
 
     for (int filter = FILTER_AUDIO; filter < FILTER_COUNT; filter++) {
         if (counts[filter] > 1)
@@ -1251,9 +1327,11 @@ int index_build_filter_index(APP_STATE *app)
     }
 
     EnterCriticalSection(&app->index_lock);
-    if (app->index_revision != revision || app->entry_count != entry_count) {
+    if (app->index_revision != revision || app->entry_count != entry_count ||
+        app->volume_count != volume_count) {
         LeaveCriticalSection(&app->index_lock);
         free(pool);
+        free(volume_pool);
         return 0;
     }
     index_clear_filter_index(app);
@@ -1266,6 +1344,14 @@ int index_build_filter_index(APP_STATE *app)
         app->filter_counts[filter] = counts[filter];
     }
     app->filter_index_ready = 1;
+    app->volume_index_pool = volume_pool;
+    for (int volume = 0; volume < volume_count && volume < 26; volume++) {
+        app->volume_indices[volume] = volume != largest_volume &&
+            volume_counts[volume] > 0
+            ? volume_pool + volume_offsets[volume] : NULL;
+        app->volume_counts[volume] = volume_counts[volume];
+    }
+    app->volume_index_ready = 1;
     LeaveCriticalSection(&app->index_lock);
     return 1;
 }

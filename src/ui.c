@@ -36,6 +36,10 @@ static HMENU g_menu_theme;
 static APP_STATE *g_app_ptr;
 static HFONT g_font_ui;
 static HFONT g_font_search;
+/* The menu bar is laid out by Windows using the system menu font.  Keep a
+   separate handle for UAH dark-mode drawing so a large content font cannot
+   make top-level menu labels run into each other. */
+static HFONT g_font_menu;
 static HBRUSH g_brush_window;
 static HBRUSH g_brush_panel;
 static COLORREF g_color_window;
@@ -260,14 +264,23 @@ static int ui_unscale(int physical)
 
 static void ui_init_visual_resources(void)
 {
+    NONCLIENTMETRICSW metrics;
+    int have_nonclient_metrics;
+
     g_color_window = RGB(255, 255, 255);
     g_color_panel = RGB(245, 245, 245);
     g_color_text = RGB(32, 37, 45);
+
+    memset(&metrics, 0, sizeof(metrics));
+    metrics.cbSize = sizeof(metrics);
+    have_nonclient_metrics = SystemParametersInfoW(
+        SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+
     if (!g_font_ui) {
-        g_font_ui = CreateFontW(
-            -20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        if (have_nonclient_metrics)
+            g_font_ui = CreateFontIndirectW(&metrics.lfMessageFont);
+        if (!g_font_ui)
+            g_font_ui = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     }
 
     if (!g_font_search) {
@@ -275,6 +288,13 @@ static void ui_init_visual_resources(void)
             -20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
+    if (!g_font_menu) {
+        if (have_nonclient_metrics)
+            g_font_menu = CreateFontIndirectW(&metrics.lfMenuFont);
+        if (!g_font_menu)
+            g_font_menu = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     }
     
     if (!g_brush_window)
@@ -285,8 +305,15 @@ static void ui_init_visual_resources(void)
 
 static void ui_free_visual_resources(void)
 {
-    if (g_font_ui) { DeleteObject(g_font_ui); g_font_ui = NULL; }
+    if (g_font_ui && g_font_ui != GetStockObject(DEFAULT_GUI_FONT)) {
+        DeleteObject(g_font_ui);
+    }
+    g_font_ui = NULL;
     if (g_font_search) { DeleteObject(g_font_search); g_font_search = NULL; }
+    if (g_font_menu && g_font_menu != GetStockObject(DEFAULT_GUI_FONT)) {
+        DeleteObject(g_font_menu);
+    }
+    g_font_menu = NULL;
     if (g_brush_window) { DeleteObject(g_brush_window); g_brush_window = NULL; }
     if (g_brush_panel) { DeleteObject(g_brush_panel); g_brush_panel = NULL; }
     ui_clear_icon_cache();
@@ -2057,7 +2084,7 @@ static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw)
     if (!g_theme_is_dark)
         return CDRF_DODEFAULT;
     if (draw->dwDrawStage == CDDS_PREPAINT)
-        return CDRF_NOTIFYITEMDRAW;
+        return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
     if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
         wchar_t text[128] = L"";
         HDITEMW item;
@@ -2124,6 +2151,27 @@ static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw)
         DeleteObject(separator);
         return CDRF_SKIPDEFAULT;
     }
+    if (draw->dwDrawStage == CDDS_POSTPAINT) {
+        RECT client;
+        RECT item_rect;
+        int item_count = Header_GetItemCount(draw->hdr.hwndFrom);
+        int content_right = 0;
+
+        GetClientRect(draw->hdr.hwndFrom, &client);
+        for (int i = 0; i < item_count; i++) {
+            if (Header_GetItemRect(draw->hdr.hwndFrom, i, &item_rect) &&
+                item_rect.right > content_right) {
+                content_right = item_rect.right;
+            }
+        }
+        if (content_right < client.right) {
+            RECT remainder = client;
+            remainder.left = content_right > client.left
+                ? content_right : client.left;
+            FillRect(draw->hdc, &remainder, g_brush_panel);
+        }
+        return CDRF_DODEFAULT;
+    }
     return CDRF_DODEFAULT;
 }
 
@@ -2175,7 +2223,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             SetBkMode(draw->draw.hDC, TRANSPARENT);
             SetTextColor(draw->draw.hDC, g_color_text);
             old_font = SelectObject(draw->draw.hDC,
-                                    g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+                                    g_font_menu ? g_font_menu :
+                                    GetStockObject(DEFAULT_GUI_FONT));
             DrawTextW(draw->draw.hDC, text, -1, &text_rect,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(draw->draw.hDC, old_font);

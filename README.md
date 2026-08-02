@@ -1,4 +1,4 @@
-# OpenEverything v0.2.3
+# OpenEverything v0.2.3 SP1
 
 Everything 的开源复刻版本。
 

@@ -1,12 +1,23 @@
 #include "search.h"
 #include "index.h"
 
-#define SEARCH_LOCK_CHUNK 32768
+#define SEARCH_LOCK_CHUNK 512
+#define SEARCH_SCOPE_PART_MAX 512
 
 typedef struct {
     APP_STATE *app;
     const SEARCH_QUERY *query;
 } SORT_CONTEXT;
+
+typedef struct {
+    const wchar_t *start;
+    size_t length;
+} SEARCH_SCOPE_PART;
+
+static int search_find_scope_volume_locked(const APP_STATE *app,
+                                           const SEARCH_QUERY *query);
+static int search_entry_is_volume_root_locked(const APP_STATE *app,
+                                              const INDEX_ENTRY *entry);
 
 static int compare_int64(long long a, long long b)
 {
@@ -29,6 +40,273 @@ static int search_matches_filter(const INDEX_ENTRY *entry, int filter_id)
     if (filter_id <= FILTER_EVERYTHING || filter_id >= FILTER_COUNT)
         return 1;
     return entry->filter_type == filter_id;
+}
+
+static int search_scope_cache_matches_locked(const APP_STATE *app,
+                                             const SEARCH_QUERY *query)
+{
+    return app && query && app->scope_index_ready &&
+           app->scope_index_revision == app->index_revision &&
+           app->scope_index_include_subfolders == query->include_subfolders &&
+           _wcsicmp(app->scope_index_path, query->folder_scope) == 0;
+}
+
+static int search_parse_scope(const SEARCH_QUERY *query,
+                              SEARCH_SCOPE_PART *parts, int capacity)
+{
+    const wchar_t *cursor;
+    size_t length;
+    int count = 0;
+
+    if (!query || !parts || capacity <= 0 || !query->folder_scope[0])
+        return 0;
+    length = wcslen(query->folder_scope);
+    if (length < 3 || query->folder_scope[1] != L':' ||
+        (query->folder_scope[2] != L'\\' && query->folder_scope[2] != L'/'))
+        return -1;
+
+    cursor = query->folder_scope + 3;
+    while (*cursor) {
+        const wchar_t *start;
+        while (*cursor == L'\\' || *cursor == L'/')
+            cursor++;
+        if (!*cursor)
+            break;
+        start = cursor;
+        while (*cursor && *cursor != L'\\' && *cursor != L'/')
+            cursor++;
+        if (count >= capacity)
+            return -1;
+        parts[count].start = start;
+        parts[count].length = (size_t)(cursor - start);
+        count++;
+    }
+    return count;
+}
+
+static int search_entry_name_matches_part_locked(const APP_STATE *app,
+                                                 const INDEX_ENTRY *entry,
+                                                 SEARCH_SCOPE_PART part)
+{
+    wchar_t name[SEARCH_FOLDER_SCOPE_MAX];
+    size_t name_length;
+
+    if (!index_copy_entry_name_locked(app, entry, name,
+                                      sizeof(name) / sizeof(name[0])))
+        return 0;
+    name_length = wcslen(name);
+    return name_length == part.length &&
+           _wcsnicmp(name, part.start, part.length) == 0;
+}
+
+static int search_entry_parent_is_root_locked(const APP_STATE *app,
+                                              const INDEX_ENTRY *entry)
+{
+    return entry->parent_ref == 0 || entry->parent_ref == NTFS_ROOT_FRN ||
+           search_entry_is_volume_root_locked(app, entry);
+}
+
+static int search_scope_path_matches_entry_locked(APP_STATE *app,
+                                                  int entry_index,
+                                                  SEARCH_SCOPE_PART *parts,
+                                                  int part_count)
+{
+    int current = entry_index;
+
+    for (int part = part_count - 1; part >= 0; part--) {
+        int parent;
+
+        if (current < 0 || current >= app->entry_count ||
+            !search_entry_name_matches_part_locked(
+                app, &app->entries[current], parts[part]))
+            return 0;
+        if (part == 0)
+            return search_entry_parent_is_root_locked(
+                app, &app->entries[current]);
+        parent = index_resolve_parent_locked(app, &app->entries[current]);
+        if (parent < 0 || parent == current)
+            return 0;
+        current = parent;
+    }
+    return 0;
+}
+
+static int search_find_scope_folder_locked(APP_STATE *app,
+                                            const SEARCH_QUERY *query,
+                                            SEARCH_SCOPE_PART *parts,
+                                            int part_count,
+                                            int volume)
+{
+    if (part_count <= 0 || volume < 0)
+        return -1;
+    for (int i = 0; i < app->entry_count; i++) {
+        INDEX_ENTRY *entry = &app->entries[i];
+        if (!entry->is_directory || entry->volume_index != volume)
+            continue;
+        if (search_scope_path_matches_entry_locked(
+                app, i, parts, part_count))
+            return i;
+    }
+    return -1;
+}
+
+static int search_scope_entry_is_descendant_locked(APP_STATE *app,
+                                                   int entry_index,
+                                                   int target_index,
+                                                   int include_subfolders)
+{
+    int current;
+
+    if (entry_index == target_index)
+        return 0;
+    current = entry_index;
+    for (int depth = 0; depth < SEARCH_SCOPE_PART_MAX; depth++) {
+        int parent = index_resolve_parent_locked(
+            app, &app->entries[current]);
+        if (parent == target_index)
+            return 1;
+        if (!include_subfolders || parent < 0 || parent == current)
+            return 0;
+        current = parent;
+        if (search_entry_parent_is_root_locked(app, &app->entries[current]))
+            return 0;
+    }
+    return 0;
+}
+
+static int search_scope_append_candidate_locked(APP_STATE *app, int index)
+{
+    int new_capacity;
+    int *resized;
+
+    if (!app || app->scope_index_count >= app->entry_count)
+        return 0;
+    if (app->scope_index_count >= app->scope_index_capacity) {
+        if (app->scope_index_capacity <= 0)
+            new_capacity = app->entry_count < 256 ? app->entry_count : 256;
+        else if (app->scope_index_capacity > app->entry_count / 2)
+            new_capacity = app->entry_count;
+        else
+            new_capacity = app->scope_index_capacity * 2;
+        resized = (int *)realloc(
+            app->scope_index_pool,
+            (size_t)new_capacity * sizeof(*app->scope_index_pool));
+        if (!resized)
+            return 0;
+        app->scope_index_pool = resized;
+        app->scope_index_capacity = new_capacity;
+    }
+    app->scope_index_pool[app->scope_index_count++] = index;
+    return 1;
+}
+
+static int search_build_scope_index_locked(APP_STATE *app,
+                                           const SEARCH_QUERY *query)
+{
+    SEARCH_SCOPE_PART parts[SEARCH_SCOPE_PART_MAX];
+    int part_count;
+    int volume;
+    int target;
+    int *volume_indices;
+    int volume_count;
+
+    if (!app || !query || !query->folder_scope[0] ||
+        query->scope_is_volume_root)
+        return 0;
+    if (search_scope_cache_matches_locked(app, query))
+        return 1;
+
+    part_count = search_parse_scope(query, parts,
+                                    SEARCH_SCOPE_PART_MAX);
+    volume = search_find_scope_volume_locked(app, query);
+    target = part_count > 0
+        ? search_find_scope_folder_locked(app, query, parts, part_count, volume)
+        : -1;
+    free(app->scope_index_pool);
+    app->scope_index_pool = NULL;
+    app->scope_index_count = 0;
+    app->scope_index_capacity = 0;
+    app->scope_index_target = target;
+    app->scope_index_volume = volume;
+    app->scope_index_include_subfolders = query->include_subfolders;
+    app->scope_index_revision = app->index_revision;
+    wcsncpy_s(app->scope_index_path, SEARCH_FOLDER_SCOPE_MAX,
+              query->folder_scope, _TRUNCATE);
+    app->scope_index_ready = 1;
+    if (target < 0 || volume < 0)
+        return 1;
+
+    volume_indices = app->volume_indices[volume];
+    volume_count = app->volume_counts[volume];
+    for (int phase = 0; phase < 2; phase++) {
+        int source_count = volume_indices ? volume_count : app->entry_count;
+        for (int source = 0; source < source_count; source++) {
+            int index = volume_indices ? volume_indices[source] : source;
+            INDEX_ENTRY *entry;
+
+            if (index < 0 || index >= app->entry_count)
+                continue;
+            entry = &app->entries[index];
+            if ((phase == 0) != (entry->is_directory != 0) ||
+                (!volume_indices && entry->volume_index != volume))
+                continue;
+            if (search_scope_entry_is_descendant_locked(
+                    app, index, target, query->include_subfolders) &&
+                !search_scope_append_candidate_locked(app, index)) {
+                free(app->scope_index_pool);
+                app->scope_index_pool = NULL;
+                app->scope_index_count = 0;
+                app->scope_index_capacity = 0;
+                app->scope_index_ready = 0;
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int search_find_scope_volume_locked(const APP_STATE *app,
+                                           const SEARCH_QUERY *query)
+{
+    wchar_t drive;
+
+    if (!app || !query || !query->scope_drive_letter)
+        return -1;
+    drive = towupper(query->scope_drive_letter);
+    for (int volume = 0; volume < app->volume_count && volume < 26; volume++) {
+        if (towupper(app->volumes[volume].drive_letter[0]) == drive)
+            return volume;
+    }
+    return -1;
+}
+
+static int search_entry_is_volume_root_locked(const APP_STATE *app,
+                                               const INDEX_ENTRY *entry)
+{
+    const char *name;
+
+    if (!app || !entry || entry->file_ref != NTFS_ROOT_FRN)
+        return 0;
+    name = index_entry_name_utf8_locked(app, entry);
+    return entry->parent_ref == NTFS_ROOT_FRN || entry->name_length == 0 ||
+           (entry->name_length == 1 && name[0] == '.');
+}
+
+static int search_matches_volume_root_locked(const APP_STATE *app,
+                                             const INDEX_ENTRY *entry,
+                                             const SEARCH_QUERY *query)
+{
+    int volume;
+
+    if (!query->scope_is_volume_root || !query->include_subfolders)
+        return 0;
+    volume = entry->volume_index;
+    if (volume < 0 || volume >= app->volume_count || volume >= 26 ||
+        towupper(app->volumes[volume].drive_letter[0]) !=
+            towupper(query->scope_drive_letter)) {
+        return 0;
+    }
+    return !search_entry_is_volume_root_locked(app, entry);
 }
 
 static int search_matches_folder(const wchar_t *path, const SEARCH_QUERY *query)
@@ -180,6 +458,7 @@ static int search_contains_pre_folded(const wchar_t *folded_text, const wchar_t 
 void search_prepare_query(SEARCH_QUERY *query)
 {
     const wchar_t *ext;
+    size_t scope_len;
     int i;
 
     if (!query)
@@ -209,6 +488,14 @@ void search_prepare_query(SEARCH_QUERY *query)
     query->has_folder_filter = wcsstr(query->text, L"folder:") != NULL;
     query->has_wildcard = wcschr(query->text, L'*') != NULL ||
                           wcschr(query->text, L'?') != NULL;
+    scope_len = wcslen(query->folder_scope);
+    query->scope_is_volume_root = scope_len == 3 &&
+                                  query->folder_scope[1] == L':' &&
+                                  (query->folder_scope[2] == L'\\' ||
+                                   query->folder_scope[2] == L'/');
+    query->scope_drive_letter = scope_len >= 2 &&
+                                query->folder_scope[1] == L':'
+        ? towupper(query->folder_scope[0]) : L'\0';
 }
 
 static int compare_entries_for_query(APP_STATE *app, int ia, int ib, int column)
@@ -360,18 +647,36 @@ int search_match_entry(APP_STATE *app, int entry_index, const SEARCH_QUERY *quer
     wchar_t name_buffer[512];
     const wchar_t *target;
     int matched = 0;
+    int volume_root_scope;
+    int scope_checked = 0;
 
     if (!app || entry_index < 0 || entry_index >= app->entry_count || !query)
         return 0;
     entry = &app->entries[entry_index];
     if (!search_matches_filter(entry, query->filter_id))
         return 0;
-    if (query->match_path || query->folder_scope[0]) {
+    volume_root_scope = query->scope_is_volume_root && query->include_subfolders;
+    if (volume_root_scope &&
+        !search_matches_volume_root_locked(app, entry, query)) {
+        return 0;
+    }
+    if (query->folder_scope[0] && !volume_root_scope &&
+        search_scope_cache_matches_locked(app, query)) {
+        scope_checked = 1;
+        if (app->scope_index_target < 0 ||
+            !search_scope_entry_is_descendant_locked(
+                app, entry_index, app->scope_index_target,
+                query->include_subfolders))
+            return 0;
+    }
+    if (query->match_path ||
+        (query->folder_scope[0] && !volume_root_scope && !scope_checked)) {
         path = index_duplicate_entry_path_locked(app, entry_index);
         if (!path)
             return 0;
     }
-    if (!search_matches_folder(path, query)) {
+    if (!volume_root_scope && !scope_checked &&
+        !search_matches_folder(path, query)) {
         free(path);
         return 0;
     }
@@ -545,6 +850,8 @@ void search_execute(APP_STATE *app)
     search_prepare_query(&app->query);
     
     EnterCriticalSection(&app->index_lock);
+    if (app->query.folder_scope[0] && !app->query.scope_is_volume_root)
+        search_build_scope_index_locked(app, &app->query);
     
     app->filtered_count = 0;
     
@@ -566,8 +873,11 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
 {
     int count = 0;
     int i = 0;
+    int volume_phase = 0;
     int fast_slot = -1;
     int fast_filter = -1;
+    int fast_scope = 0;
+    int fast_volume = -1;
     
     if (!out_indices || max_results <= 0)
         return 0;
@@ -660,21 +970,126 @@ int search_execute_subset_to_buffer(APP_STATE *app, const SEARCH_QUERY *query,
     }
 
     EnterCriticalSection(&app->index_lock);
+    if (query->folder_scope[0] && !query->scope_is_volume_root)
+        search_build_scope_index_locked(app, query);
     if (!base_indices && !base_identity) {
-        if (search_query_has_plain_name_fast_path(query))
+        int best_count = INT_MAX;
+
+        if (search_query_has_plain_name_fast_path(query)) {
             fast_slot = search_best_name_char_slot(app, query);
+            if (fast_slot >= 0)
+                best_count = app->name_char_counts[fast_slot];
+        }
         if (query->filter_id > FILTER_EVERYTHING &&
             query->filter_id < FILTER_COUNT && app->filter_index_ready) {
             int filter_count = app->filter_counts[query->filter_id];
-            if (fast_slot < 0 || filter_count <= app->name_char_counts[fast_slot]) {
+            if (filter_count <= best_count) {
                 fast_filter = query->filter_id;
                 fast_slot = -1;
+                best_count = filter_count;
             }
+        }
+        if (query->scope_is_volume_root && query->include_subfolders &&
+            app->volume_index_ready) {
+            int volume = search_find_scope_volume_locked(app, query);
+            if (volume >= 0 && app->volume_counts[volume] <= best_count) {
+                fast_volume = volume;
+                fast_filter = -1;
+                fast_slot = -1;
+            }
+        }
+        if (!query->scope_is_volume_root &&
+            search_scope_cache_matches_locked(app, query) &&
+            app->scope_index_count <= best_count) {
+            fast_scope = 1;
+            fast_volume = -1;
+            fast_filter = -1;
+            fast_slot = -1;
         }
     }
     LeaveCriticalSection(&app->index_lock);
     
-    if (fast_filter >= 0) {
+    if (fast_scope) {
+        for (;;) {
+            int end;
+            int scope_count;
+            int *scope_indices;
+
+            EnterCriticalSection(&app->index_lock);
+            scope_count = app->scope_index_count;
+            scope_indices = app->scope_index_pool;
+            if (!app->scope_index_ready || !scope_indices ||
+                i >= scope_count || count >= max_results) {
+                LeaveCriticalSection(&app->index_lock);
+                break;
+            }
+            end = i + SEARCH_LOCK_CHUNK;
+            if (end > scope_count)
+                end = scope_count;
+            for (; i < end && count < max_results; i++) {
+                int idx = scope_indices[i];
+                if (idx >= 0 && idx < app->entry_count &&
+                    search_match_entry(app, idx, query))
+                    out_indices[count++] = idx;
+            }
+            LeaveCriticalSection(&app->index_lock);
+            if (generation != app->search_generation)
+                break;
+        }
+    } else if (fast_volume >= 0) {
+        for (;;) {
+            int end;
+            int entry_count;
+            int volume_entry_count;
+            int *volume_indices;
+            int done = 0;
+
+            EnterCriticalSection(&app->index_lock);
+            entry_count = app->entry_count;
+            volume_entry_count = app->volume_counts[fast_volume];
+            volume_indices = app->volume_indices[fast_volume];
+            if (!app->volume_index_ready || volume_entry_count <= 0 ||
+                count >= max_results) {
+                done = 1;
+            } else if (volume_indices) {
+                if (i >= volume_entry_count) {
+                    done = 1;
+                } else {
+                    end = i + SEARCH_LOCK_CHUNK;
+                    if (end > volume_entry_count)
+                        end = volume_entry_count;
+                    for (; i < end && count < max_results; i++) {
+                        int idx = volume_indices[i];
+                        if (idx >= 0 && idx < entry_count &&
+                            search_match_entry(app, idx, query))
+                            out_indices[count++] = idx;
+                    }
+                }
+            } else if (volume_phase >= 2) {
+                done = 1;
+            } else {
+                end = i + SEARCH_LOCK_CHUNK;
+                if (end > entry_count)
+                    end = entry_count;
+                for (; i < end && count < max_results; i++) {
+                    INDEX_ENTRY *entry = &app->entries[i];
+                    if ((volume_phase == 0) != (entry->is_directory != 0) ||
+                        entry->volume_index != fast_volume)
+                        continue;
+                    if (search_match_entry(app, i, query))
+                        out_indices[count++] = i;
+                }
+                if (i >= entry_count) {
+                    volume_phase++;
+                    i = 0;
+                }
+            }
+
+            LeaveCriticalSection(&app->index_lock);
+            if (done || generation != app->search_generation)
+                break;
+        }
+    } else if (fast_filter >= 0) {
         for (;;) {
             int end;
             int entry_count;

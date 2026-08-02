@@ -43,6 +43,8 @@ int index_build_filter_index(APP_STATE *app);
 void index_clear_filter_index(APP_STATE *app);
 int index_build_ref_index(APP_STATE *app);
 void index_clear_ref_index(APP_STATE *app);
+/* The caller must hold index_lock. Repairs parent_index using the ref index. */
+int index_resolve_parent_locked(APP_STATE *app, INDEX_ENTRY *entry);
 void index_sort_entries_by_name(APP_STATE *app);
 void index_free_entry(INDEX_ENTRY *entry);
 /* The caller must hold app->index_lock while using these helpers. */

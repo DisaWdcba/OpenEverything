@@ -461,6 +461,8 @@ typedef struct {
     int filter_id;
     wchar_t folder_scope[SEARCH_FOLDER_SCOPE_MAX];
     int include_subfolders;
+    int scope_is_volume_root;
+    wchar_t scope_drive_letter;
     int sort_column;
     int sort_ascending;
 } SEARCH_QUERY;
@@ -490,6 +492,19 @@ typedef struct {
     int *filter_indices[FILTER_COUNT];
     int filter_counts[FILTER_COUNT];
     int filter_index_ready;
+    int *volume_index_pool;
+    int *volume_indices[26];
+    int volume_counts[26];
+    int volume_index_ready;
+    int *scope_index_pool;
+    int scope_index_count;
+    int scope_index_capacity;
+    int scope_index_target;
+    int scope_index_volume;
+    int scope_index_include_subfolders;
+    LONG scope_index_revision;
+    wchar_t scope_index_path[SEARCH_FOLDER_SCOPE_MAX];
+    int scope_index_ready;
     int *ref_index_values;
     int ref_index_capacity;
     int ref_index_ready;
