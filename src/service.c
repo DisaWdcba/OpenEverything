@@ -8,9 +8,11 @@
 #include <shlobj.h>
 
 #define SERVICE_SYNC_MAX_CHANGES 16384
-#define SERVICE_SYNC_INTERVAL_MS 1000
-#define SERVICE_SAVE_QUIET_MS 3000
-#define SERVICE_SAVE_MAX_DELAY_MS 30000
+/* USN reads are non-blocking.  A short cadence keeps the on-disk cache and
+   clients close to real time without reopening a volume on every pass. */
+#define SERVICE_SYNC_INTERVAL_MS 250
+#define SERVICE_SAVE_QUIET_MS 1000
+#define SERVICE_SAVE_MAX_DELAY_MS 10000
 #define SERVICE_PIPE_BUFFER 4096
 #ifndef PIPE_REJECT_REMOTE_CLIENTS
 #define PIPE_REJECT_REMOTE_CLIENTS 0x00000008
@@ -23,10 +25,60 @@ static SERVICE_STATUS g_service_status;
 static HANDLE g_stop_event;
 static HANDLE g_refresh_event;
 static HANDLE g_pipe_thread;
+static HANDLE g_volume_handles[26];
 static volatile LONG g_runtime_state = OE_SERVICE_STATE_STARTING;
 static volatile LONG g_last_error;
 static volatile LONG g_update_sequence;
 static volatile LONG64 g_last_update_unix;
+
+static void service_close_volume_handles(void)
+{
+    for (int i = 0; i < (int)(sizeof(g_volume_handles) /
+                              sizeof(g_volume_handles[0])); i++) {
+        if (g_volume_handles[i]) {
+            ntfs_close_volume(g_volume_handles[i]);
+            g_volume_handles[i] = NULL;
+        }
+    }
+}
+
+static HANDLE service_acquire_volume(int index, const wchar_t *path,
+                                     USN_JOURNAL_DATA_BUF *journal)
+{
+    HANDLE volume;
+
+    if (index < 0 || index >= (int)(sizeof(g_volume_handles) /
+                                    sizeof(g_volume_handles[0])) ||
+        !path || !path[0])
+        return NULL;
+
+    volume = g_volume_handles[index];
+    if (!volume) {
+        volume = ntfs_open_volume(path);
+        if (!volume)
+            return NULL;
+        g_volume_handles[index] = volume;
+    }
+
+    if (journal && ntfs_query_usn_journal(volume, journal))
+        return volume;
+
+    /* A removable volume can disappear while the service is idle.  Drop the
+       stale handle and make one immediate reopen attempt so the next poll does
+       not wait for a full rebuild just because a handle went stale. */
+    ntfs_close_volume(volume);
+    g_volume_handles[index] = NULL;
+    volume = ntfs_open_volume(path);
+    if (!volume)
+        return NULL;
+    g_volume_handles[index] = volume;
+    if (journal && !ntfs_query_usn_journal(volume, journal)) {
+        ntfs_close_volume(volume);
+        g_volume_handles[index] = NULL;
+        return NULL;
+    }
+    return volume;
+}
 
 static long long service_unix_now(void)
 {
@@ -274,6 +326,7 @@ static int service_sync_once(APP_STATE *app, int *needs_rebuild,
     local_volume_count = app->volume_count;
     if (current_count != local_volume_count) {
         LeaveCriticalSection(&app->index_lock);
+        service_close_volume_handles();
         *needs_rebuild = 1;
         return 1;
     }
@@ -281,6 +334,7 @@ static int service_sync_once(APP_STATE *app, int *needs_rebuild,
         if (_wcsicmp(current[i].drive_letter,
                      app->volumes[i].drive_letter) != 0) {
             LeaveCriticalSection(&app->index_lock);
+            service_close_volume_handles();
             *needs_rebuild = 1;
             return 1;
         }
@@ -302,18 +356,14 @@ static int service_sync_once(APP_STATE *app, int *needs_rebuild,
         saved_next_usn = app->volumes[i].usn_next_usn;
         LeaveCriticalSection(&app->index_lock);
 
-        volume = ntfs_open_volume(volume_path);
+        volume = service_acquire_volume(i, volume_path, &journal);
         if (!volume)
             continue;
-        if (!ntfs_query_usn_journal(volume, &journal)) {
-            ntfs_close_volume(volume);
-            continue;
-        }
         if (saved_journal_id == 0 ||
             saved_journal_id != journal.UsnJournalId ||
             saved_next_usn < journal.LowestValidUsn ||
             saved_next_usn > journal.NextUsn) {
-            ntfs_close_volume(volume);
+            service_close_volume_handles();
             *needs_rebuild = 1;
             return 1;
         }
@@ -328,7 +378,6 @@ static int service_sync_once(APP_STATE *app, int *needs_rebuild,
                 SERVICE_SYNC_MAX_CHANGES);
 
             if (!read_ok) {
-                ntfs_close_volume(volume);
                 continue;
             }
             for (int offset = 0; offset < count; offset += 512) {
@@ -347,7 +396,6 @@ static int service_sync_once(APP_STATE *app, int *needs_rebuild,
                 journal.LowestValidUsn;
             LeaveCriticalSection(&app->index_lock);
         }
-        ntfs_close_volume(volume);
     }
     *changed_count = total_applied;
     return 1;
@@ -377,6 +425,7 @@ static int service_rebuild_index(APP_STATE *app, const wchar_t *index_path)
     int failed_volumes = 0;
 
     service_set_runtime_state(OE_SERVICE_STATE_BUILDING, ERROR_SUCCESS);
+    service_close_volume_handles();
     index_clear(app);
     app->indexed_volume_count = 0;
     app->index_error_count = 0;
@@ -400,13 +449,19 @@ static int service_rebuild_index(APP_STATE *app, const wchar_t *index_path)
         if (ntfs_read_mft(volume, &build, i, NULL) > 0 ||
             ntfs_read_usn_index(volume, &build, i, NULL) > 0) {
             indexed_volumes++;
+            ntfs_update_volume_usn_info(volume, &app->volumes[i]);
+            g_volume_handles[i] = volume;
         } else {
             failed_volumes++;
+            ntfs_close_volume(volume);
+            volume = NULL;
         }
-        ntfs_update_volume_usn_info(volume, &app->volumes[i]);
-        ntfs_close_volume(volume);
         if (!index_add_entries(app, &build)) {
             index_build_free(&build);
+            if (volume) {
+                ntfs_close_volume(volume);
+                g_volume_handles[i] = NULL;
+            }
             service_set_runtime_state(OE_SERVICE_STATE_ERROR,
                                       ERROR_NOT_ENOUGH_MEMORY);
             return 0;
@@ -553,6 +608,7 @@ static void service_cleanup(void)
         CloseHandle(g_pipe_thread);
         g_pipe_thread = NULL;
     }
+    service_close_volume_handles();
     index_clear(&g_app);
     free(g_app.entries);
     free(g_app.filtered_indices);

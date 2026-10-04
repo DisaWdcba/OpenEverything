@@ -83,12 +83,6 @@ typedef char cache_entry_v4_size_must_be_70[
     sizeof(CACHE_ENTRY_V4) == 70 ? 1 : -1];
 
 typedef struct {
-    long long file_ref;
-    int volume_index;
-    int index;
-} CACHE_REF_LOOKUP;
-
-typedef struct {
     VOLUME_INFO volumes[26];
     INDEX_ENTRY *entries;
     INDEX_NAME_POOL names;
@@ -168,8 +162,15 @@ static int cache_load_capacity(int entry_count)
     int capacity = 1;
 
     if (entry_count > 0) {
-        int reserve = entry_count / 16;
-        if (reserve < 65536)
+        /* The cache is the steady-state service representation.  A 6.25%
+           spare allocation made a 10 million entry index keep tens of
+           megabytes of zeroed, never-used INDEX_ENTRY rows resident.  Keep a
+           small insertion cushion and let the normal growth path expand it
+           when a real USN create arrives. */
+        int reserve = entry_count / 64;
+        if (reserve < 8192)
+            reserve = 8192;
+        if (reserve > 65536)
             reserve = 65536;
         capacity = entry_count <= INT_MAX - reserve
             ? entry_count + reserve : entry_count;
@@ -221,39 +222,6 @@ static int cache_append_wide_name(const unsigned char **cursor,
     return 1;
 }
 
-static int cache_ref_compare(const void *a, const void *b)
-{
-    const CACHE_REF_LOOKUP *ra = (const CACHE_REF_LOOKUP *)a;
-    const CACHE_REF_LOOKUP *rb = (const CACHE_REF_LOOKUP *)b;
-
-    if (ra->volume_index != rb->volume_index)
-        return ra->volume_index < rb->volume_index ? -1 : 1;
-    if (ra->file_ref != rb->file_ref)
-        return ra->file_ref < rb->file_ref ? -1 : 1;
-    return 0;
-}
-
-static int cache_ref_find(const CACHE_REF_LOOKUP *lookup, int count,
-                          int volume_index, long long file_ref)
-{
-    int lo = 0;
-    int hi = count - 1;
-
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        const CACHE_REF_LOOKUP *entry = &lookup[mid];
-
-        if (entry->volume_index == volume_index && entry->file_ref == file_ref)
-            return entry->index;
-        if (entry->volume_index < volume_index ||
-            (entry->volume_index == volume_index && entry->file_ref < file_ref))
-            lo = mid + 1;
-        else
-            hi = mid - 1;
-    }
-    return CACHE_PARENT_NONE;
-}
-
 static int cache_index_snapshot_matches(APP_STATE *app, int entry_count,
                                         int volume_count, LONG revision)
 {
@@ -270,7 +238,6 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     FILE *f = NULL;
     CACHE_HEADER_V6 header;
     VOLUME_INFO volumes[26];
-    CACHE_REF_LOOKUP *lookup = NULL;
     CACHE_ENTRY_V6 *record_batch = NULL;
     unsigned short *path_lengths = NULL;
     char *name_batch = NULL;
@@ -303,14 +270,11 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     if (!ok)
         return 0;
 
-    lookup = (CACHE_REF_LOOKUP *)malloc(
-        (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*lookup));
     record_batch = (CACHE_ENTRY_V6 *)malloc(
         CACHE_IO_BATCH * sizeof(*record_batch));
     path_lengths = (unsigned short *)malloc(
         (size_t)(entry_count > 0 ? entry_count : 1) * sizeof(*path_lengths));
-    if (!lookup || !record_batch || !path_lengths) {
-        free(lookup);
+    if (!record_batch || !path_lengths) {
         free(record_batch);
         free(path_lengths);
         return 0;
@@ -319,18 +283,10 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
     EnterCriticalSection(&app->index_lock);
     if (!cache_index_snapshot_matches(app, entry_count, volume_count, revision)) {
         ok = 0;
-    } else {
-        for (int i = 0; i < entry_count; i++) {
-            lookup[i].file_ref = app->entries[i].file_ref;
-            lookup[i].volume_index = app->entries[i].volume_index;
-            lookup[i].index = i;
-        }
     }
     LeaveCriticalSection(&app->index_lock);
     if (!ok)
         goto cleanup;
-
-    qsort(lookup, (size_t)entry_count, sizeof(*lookup), cache_ref_compare);
 
     for (int i = 0; ok && i < entry_count; ) {
         int batch_end = i + CACHE_IO_BATCH;
@@ -444,8 +400,11 @@ int cache_save_index_to_path(APP_STATE *app, const wchar_t *target_path)
                 ce->parent_index = CACHE_PARENT_NONE;
                 if (entry->parent_ref != 0 && entry->parent_ref != 5 &&
                     entry->parent_ref != entry->file_ref) {
-                    ce->parent_index = cache_ref_find(
-                        lookup, entry_count, entry->volume_index, entry->parent_ref);
+                    /* The entry keeps a validated parent hint.  Repair it
+                       under the index lock when a USN move or delete made it
+                       stale; this avoids a second full-size ref lookup table
+                       during every cache save. */
+                    ce->parent_index = index_resolve_parent_locked(app, entry);
                 }
                 ce->name_len = (uint16_t)name_len;
                 ce->path_len = (uint16_t)path_len;
@@ -557,7 +516,6 @@ cleanup:
     free(name_batch);
     free(path_lengths);
     free(record_batch);
-    free(lookup);
 
     if (ok && !MoveFileExW(temp_path, path,
                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
