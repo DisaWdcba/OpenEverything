@@ -281,53 +281,152 @@ enum_done:
     return build->count;
 }
 
-static int ntfs_grow_changes(USN_CHANGE **changes, int *capacity, int needed)
+/* USN records used to allocate one heap block for every file name.  A busy
+   volume can produce thousands of records in one poll, leaving the service
+   with allocator fragmentation and a large transient working-set spike.  Keep
+   the array header and one growable UTF-16 arena together instead. */
+#define NTFS_USN_CHANGE_MAGIC 0x4E555343U
+typedef struct {
+    unsigned int magic;
+    int capacity;
+    wchar_t *name_storage;
+    size_t name_size;
+    size_t name_capacity;
+} NTFS_USN_CHANGE_ALLOC;
+
+static USN_CHANGE *ntfs_change_array(NTFS_USN_CHANGE_ALLOC *storage)
 {
-    if (needed <= *capacity)
+    return storage ? (USN_CHANGE *)(storage + 1) : NULL;
+}
+
+static int ntfs_grow_changes(NTFS_USN_CHANGE_ALLOC **storage, int needed)
+{
+    NTFS_USN_CHANGE_ALLOC *grown;
+    int old_capacity;
+    int new_cap;
+    size_t bytes;
+
+    if (!storage || needed < 0)
+        return 0;
+    old_capacity = *storage ? (*storage)->capacity : 0;
+    if (needed <= old_capacity)
         return 1;
-    
     if (needed > (int)(INT_MAX / sizeof(USN_CHANGE)))
         return 0;
 
-    int new_cap = *capacity > 0 ? *capacity : 4096;
+    new_cap = old_capacity > 0 ? old_capacity : 4096;
     while (new_cap < needed) {
-        if (new_cap > INT_MAX / 2)
-            return 0;
+        if (new_cap > INT_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
         new_cap *= 2;
     }
-
-    USN_CHANGE *new_changes = (USN_CHANGE *)realloc(*changes, (size_t)new_cap * sizeof(USN_CHANGE));
-    if (!new_changes)
+    if (new_cap <= 0 ||
+        (size_t)new_cap > (SIZE_MAX - sizeof(NTFS_USN_CHANGE_ALLOC)) /
+                           sizeof(USN_CHANGE))
         return 0;
-
-    memset(new_changes + *capacity, 0, (size_t)(new_cap - *capacity) * sizeof(USN_CHANGE));
-    *changes = new_changes;
-    *capacity = new_cap;
+    bytes = sizeof(NTFS_USN_CHANGE_ALLOC) +
+            (size_t)new_cap * sizeof(USN_CHANGE);
+    grown = (NTFS_USN_CHANGE_ALLOC *)realloc(*storage, bytes);
+    if (!grown)
+        return 0;
+    if (old_capacity == 0) {
+        grown->magic = NTFS_USN_CHANGE_MAGIC;
+        grown->name_storage = NULL;
+        grown->name_size = 0;
+        grown->name_capacity = 0;
+    }
+    if (new_cap > old_capacity)
+        memset(ntfs_change_array(grown) + old_capacity, 0,
+               (size_t)(new_cap - old_capacity) * sizeof(USN_CHANGE));
+    grown->capacity = new_cap;
+    *storage = grown;
     return 1;
 }
 
-static int ntfs_add_usn_change(USN_CHANGE **changes, int *count, int *capacity,
-                               USN_RECORD_BUF *rec, int volume_index)
+static int ntfs_reserve_change_names(NTFS_USN_CHANGE_ALLOC *storage,
+                                     int count, size_t additional)
+{
+    wchar_t *old_storage;
+    wchar_t *grown;
+    size_t needed;
+    size_t capacity;
+
+    if (!storage || additional > SIZE_MAX - storage->name_size)
+        return 0;
+    needed = storage->name_size + additional;
+    if (needed <= storage->name_capacity)
+        return 1;
+    capacity = storage->name_capacity > 0 ? storage->name_capacity : 65536;
+    while (capacity < needed) {
+        size_t next = capacity + capacity / 2 + 4096;
+        if (next <= capacity) {
+            capacity = needed;
+            break;
+        }
+        capacity = next;
+    }
+    if (capacity > SIZE_MAX / sizeof(wchar_t))
+        return 0;
+    old_storage = storage->name_storage;
+    grown = (wchar_t *)realloc(old_storage,
+                               capacity * sizeof(wchar_t));
+    if (!grown)
+        return 0;
+    if (old_storage && grown != old_storage) {
+        USN_CHANGE *changes = ntfs_change_array(storage);
+        for (int i = 0; i < count; i++) {
+            if (changes[i].name) {
+                ptrdiff_t offset = changes[i].name - old_storage;
+                changes[i].name = grown + offset;
+            }
+        }
+    }
+    storage->name_storage = grown;
+    storage->name_capacity = capacity;
+    return 1;
+}
+
+static int ntfs_add_usn_change(NTFS_USN_CHANGE_ALLOC **storage,
+                               int *count, USN_RECORD_BUF *rec,
+                               int volume_index)
 {
     const wchar_t *name_ptr;
     int name_chars;
+    unsigned int name_reason_mask = USN_REASON_FILE_CREATE |
+                                    USN_REASON_RENAME_NEW_NAME;
+    int needs_name;
+    USN_CHANGE *changes;
+    USN_CHANGE *change;
 
-    /* A record we cannot bound is skipped, not treated as a read failure. */
-    if (!ntfs_usn_record_name(rec, rec->RecordLength, &name_ptr, &name_chars))
+    if (!storage || !count || !rec)
+        return 0;
+    needs_name = (rec->Reason & name_reason_mask) != 0;
+    name_ptr = NULL;
+    name_chars = 0;
+    /* Data/metadata updates are keyed by FRN and do not use the name.  Avoid
+       validating and copying the inline name for those common records. */
+    if (needs_name &&
+        !ntfs_usn_record_name(rec, rec->RecordLength, &name_ptr, &name_chars))
         return 1;
 
-    if (!ntfs_grow_changes(changes, capacity, *count + 1))
+    if (!ntfs_grow_changes(storage, *count + 1))
         return 0;
 
-    USN_CHANGE *change = &(*changes)[*count];
+    changes = ntfs_change_array(*storage);
+    change = &changes[*count];
     memset(change, 0, sizeof(*change));
 
-    change->name = (wchar_t *)calloc((size_t)name_chars + 1, sizeof(wchar_t));
-    if (!change->name)
-        return 0;
-
-    memcpy(change->name, name_ptr, (size_t)name_chars * sizeof(wchar_t));
-    change->name[name_chars] = L'\0';
+    if (name_chars > 0) {
+        if (!ntfs_reserve_change_names(*storage, *count,
+                                       (size_t)name_chars + 1))
+            return 0;
+        change->name = (*storage)->name_storage + (*storage)->name_size;
+        memcpy(change->name, name_ptr, (size_t)name_chars * sizeof(wchar_t));
+        change->name[name_chars] = L'\0';
+        (*storage)->name_size += (size_t)name_chars + 1;
+    }
     change->file_ref = ntfs_ref_to_frn(rec->FileReferenceNumber);
     change->parent_ref = ntfs_ref_to_frn(rec->ParentFileReferenceNumber);
     change->usn = rec->Usn;
@@ -349,9 +448,8 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
     READ_USN_JOURNAL_BUF read;
     char *buffer = NULL;
     DWORD buffer_size = 1024 * 1024;
-    USN_CHANGE *changes = NULL;
+    NTFS_USN_CHANGE_ALLOC *storage = NULL;
     int change_count = 0;
-    int change_cap = 0;
     long long next_usn = start_usn;
     int ok = 0;
     
@@ -414,7 +512,7 @@ int ntfs_read_usn_changes(HANDLE hVolume, long long start_usn, long long journal
                 offset + rec->RecordLength > bytes)
                 break;
 
-            if (!ntfs_add_usn_change(&changes, &change_count, &change_cap, rec, volume_index)) {
+            if (!ntfs_add_usn_change(&storage, &change_count, rec, volume_index)) {
                 ok = 0;
                 goto done;
             }
@@ -442,11 +540,12 @@ done:
     free(buffer);
     
     if (!ok) {
-        ntfs_free_usn_changes(changes, change_count);
+        if (storage)
+            ntfs_free_usn_changes(ntfs_change_array(storage), change_count);
         return 0;
     }
     
-    *out_changes = changes;
+    *out_changes = storage ? ntfs_change_array(storage) : NULL;
     *out_count = change_count;
     *out_next_usn = next_usn;
     return 1;
@@ -454,12 +553,22 @@ done:
 
 void ntfs_free_usn_changes(USN_CHANGE *changes, int count)
 {
+    NTFS_USN_CHANGE_ALLOC *storage;
+
     if (!changes)
         return;
-    
+
+    storage = ((NTFS_USN_CHANGE_ALLOC *)changes) - 1;
+    if (storage->magic == NTFS_USN_CHANGE_MAGIC) {
+        free(storage->name_storage);
+        free(storage);
+        return;
+    }
+
+    /* Keep the old behavior for callers that hand this helper a legacy array
+       from an older in-process module. */
     for (int i = 0; i < count; i++)
         free(changes[i].name);
-    
     free(changes);
 }
 

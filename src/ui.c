@@ -105,7 +105,7 @@ static int g_icon_cache_count;
 static int g_icon_cache_capacity;
 
 #define UI_SEARCH_TOP 4
-#define UI_SEARCH_HEIGHT 36
+#define UI_SEARCH_HEIGHT 40
 #define UI_SPLITTER_SIZE 6
 #define IDT_SEARCH_DEBOUNCE 1
 #define IDT_STARTUP_SYNC 2
@@ -213,7 +213,7 @@ static void ui_populate_folder_roots(void);
 static void ui_start_folder_enum(HTREEITEM item, FOLDER_NODE *node);
 static void ui_handle_folder_enum_result(FOLDER_ENUM_RESULT *result);
 static void ui_free_folder_result(FOLDER_ENUM_RESULT *result);
-static void ui_hide_horizontal_scrollbar(HWND hwndList);
+static void ui_disable_horizontal_scrollbar(HWND hwndList);
 static void ui_update_sort_indicator(HWND hwndList, int column, int ascending);
 static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_same);
 static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw);
@@ -964,6 +964,11 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
     int loaded;
     
     loaded = cache_load_index(ctx->app);
+    if (loaded == CACHE_LOAD_LEGACY && !ctx->app->shutting_down) {
+        /* Parent rows are resolved through the ref index while converting a
+           legacy cache, avoiding a linear scan for every directory. */
+        index_build_ref_index(ctx->app);
+    }
     if (loaded == CACHE_LOAD_LEGACY && !ctx->app->shutting_down &&
         cache_save_index(ctx->app)) {
         int reloaded = cache_load_index(ctx->app);
@@ -973,16 +978,20 @@ static DWORD WINAPI cache_load_thread_proc(void *p)
                 PostMessageW(ctx->hwnd, WM_CACHE_UPGRADE_DONE, 0, 0);
         }
     }
-    if (loaded && !ctx->app->shutting_down) {
+    if (loaded && !ctx->app->shutting_down)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        index_build_filter_index(ctx->app);
-        index_build_ref_index(ctx->app);
-    }
+
+    /* Let the window show the persisted snapshot as soon as it is mapped.  The
+       filter/ref/name accelerators are optional and can be built after the
+       first search has started; each builder publishes under index_lock and
+       the search path already falls back to a linear scan while they are cold. */
     InterlockedExchange(&g_cache_loading, 0);
     if (!ctx->app->shutting_down)
         PostMessageW(ctx->hwnd, loaded ? WM_CACHE_LOADED : WM_REFRESH,
                      (WPARAM)loaded, 0);
     if (loaded && !ctx->app->shutting_down) {
+        index_build_filter_index(ctx->app);
+        index_build_ref_index(ctx->app);
         index_build_name_char_index(ctx->app);
     }
     free(ctx);
@@ -1499,7 +1508,7 @@ void ui_update_listview(HWND hwndList, APP_STATE *app)
 {
     int count = app->filtered_count;
     ListView_SetItemCountEx(hwndList, count, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
-    ui_hide_horizontal_scrollbar(hwndList);
+    ui_disable_horizontal_scrollbar(hwndList);
     InvalidateRect(hwndList, NULL, FALSE);
 }
 
@@ -1507,7 +1516,7 @@ static void ui_update_listview_count(HWND hwndList, APP_STATE *app)
 {
     ListView_SetItemCountEx(hwndList, app->filtered_count,
                             LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
-    ui_hide_horizontal_scrollbar(hwndList);
+    ui_disable_horizontal_scrollbar(hwndList);
 }
 
 void ui_update_status(HWND hwndStatus, APP_STATE *app)
@@ -1990,7 +1999,7 @@ static void ui_apply_layout(HWND hwnd)
         MoveWindow(g_hwndFilterList, x, list_top + header_h,
                    width, content_bottom - list_top - header_h, TRUE);
     }
-    ui_hide_horizontal_scrollbar(g_hwndList);
+    ui_disable_horizontal_scrollbar(g_hwndList);
 }
 
 static int ui_splitter_hit_test(HWND hwnd, POINT point)
@@ -2031,10 +2040,30 @@ static void ui_dock_panel(int panel, int side)
     ui_apply_layout(app->hwnd_main);
 }
 
-static void ui_hide_horizontal_scrollbar(HWND hwndList)
+static void ui_disable_horizontal_scrollbar(HWND hwndList)
 {
-    if (hwndList)
-        ShowScrollBar(hwndList, SB_HORZ, FALSE);
+    LONG_PTR style;
+    int refresh_frame;
+
+    if (!hwndList)
+        return;
+
+    style = GetWindowLongPtrW(hwndList, GWL_STYLE);
+    refresh_frame = (style & WS_HSCROLL) != 0;
+
+    /* Let Windows remove the non-client scrollbar before stripping any
+       lingering style bit, otherwise a disabled scrollbar frame can remain. */
+    ShowScrollBar(hwndList, SB_HORZ, FALSE);
+    style = GetWindowLongPtrW(hwndList, GWL_STYLE);
+    if (style & WS_HSCROLL) {
+        SetWindowLongPtrW(hwndList, GWL_STYLE, style & ~WS_HSCROLL);
+        refresh_frame = 1;
+    }
+    if (refresh_frame) {
+        SetWindowPos(hwndList, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
 }
 
 static void ui_update_sort_indicator(HWND hwndList, int column, int ascending)
@@ -2367,7 +2396,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         col.pszText = L"Extension";     col.cx = ui_scale(app->column_width_extension);  col.iSubItem = COL_EXTENSION;  ListView_InsertColumn(g_hwndList, COL_EXTENSION, &col);
         ui_update_sort_indicator(g_hwndList, app->query.sort_column,
                                  app->query.sort_ascending);
-        ui_hide_horizontal_scrollbar(g_hwndList);
+        ui_disable_horizontal_scrollbar(g_hwndList);
         
         /* Set font */
         SendMessageW(g_hwndSearch, WM_SETFONT, (WPARAM)g_font_search, TRUE);
@@ -3514,6 +3543,13 @@ static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     (void)ref_data;
 
     switch (msg) {
+    case WM_STYLECHANGING:
+        if ((int)wParam == GWL_STYLE && lParam) {
+            STYLESTRUCT *styles = (STYLESTRUCT *)lParam;
+            styles->styleNew &= ~WS_HSCROLL;
+        }
+        return DefSubclassProc(hwnd, msg, wParam, lParam);
+
     case WM_VSCROLL:
         scroll_code = LOWORD(wParam);
         if (scroll_code == SB_THUMBTRACK)
@@ -3525,11 +3561,11 @@ static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_in_scroll_thumb = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        ui_hide_horizontal_scrollbar(hwnd);
+        ui_disable_horizontal_scrollbar(hwnd);
         return result;
 
     case WM_HSCROLL:
-        ui_hide_horizontal_scrollbar(hwnd);
+        ui_disable_horizontal_scrollbar(hwnd);
         return 0;
 
     case WM_NOTIFY:
@@ -3540,12 +3576,12 @@ static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 return ui_custom_draw_list_header((NMCUSTOMDRAW *)lParam);
         }
         result = DefSubclassProc(hwnd, msg, wParam, lParam);
-        ui_hide_horizontal_scrollbar(hwnd);
+        ui_disable_horizontal_scrollbar(hwnd);
         return result;
 
     case WM_SIZE:
         result = DefSubclassProc(hwnd, msg, wParam, lParam);
-        ui_hide_horizontal_scrollbar(hwnd);
+        ui_disable_horizontal_scrollbar(hwnd);
         return result;
 
     case WM_CAPTURECHANGED:

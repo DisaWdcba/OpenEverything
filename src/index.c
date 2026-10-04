@@ -846,22 +846,37 @@ static int index_find_by_ref_locked(APP_STATE *app, int volume_index, long long 
 
 static int index_ensure_capacity_locked(APP_STATE *app, int needed)
 {
+    INDEX_ENTRY *grown;
+    int old_capacity;
+
     if (needed <= app->entry_capacity)
         return 1;
-    
+
+    old_capacity = app->entry_capacity;
     int new_cap = app->entry_capacity > 0 ? app->entry_capacity : 65536;
-    while (new_cap < needed)
+    while (new_cap < needed) {
+        if (new_cap > INT_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
         new_cap *= 2;
-    
-    INDEX_ENTRY *new_entries = (INDEX_ENTRY *)calloc(new_cap, sizeof(INDEX_ENTRY));
-    if (!new_entries) {
-        free(new_entries);
-        return 0;
     }
-    
-    memcpy(new_entries, app->entries, app->entry_count * sizeof(INDEX_ENTRY));
-    free(app->entries);
-    app->entries = new_entries;
+    if (new_cap <= 0 ||
+        (size_t)new_cap > SIZE_MAX / sizeof(*app->entries))
+        return 0;
+
+    /* realloc usually grows in place and avoids a second full-sized entry
+       array during a burst of USN creates.  The old calloc+copy path doubled
+       the service's private bytes at exactly the point where a busy volume
+       was already producing the most changes. */
+    grown = (INDEX_ENTRY *)realloc(
+        app->entries, (size_t)new_cap * sizeof(*grown));
+    if (!grown)
+        return 0;
+    if (new_cap > old_capacity)
+        memset(grown + old_capacity, 0,
+               (size_t)(new_cap - old_capacity) * sizeof(*grown));
+    app->entries = grown;
     app->entry_capacity = new_cap;
     return 1;
 }
