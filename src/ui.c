@@ -2038,6 +2038,16 @@ static void ui_dock_panel(int panel, int side)
         *other = side == PANEL_DOCK_LEFT ? PANEL_DOCK_RIGHT : PANEL_DOCK_LEFT;
     *moving = side;
     ui_apply_layout(app->hwnd_main);
+
+    /* The main list is a clipped child of the frame.  Moving it from one
+       side to the other can leave its old header/body pixels behind because
+       the frame does not receive an automatic erase for the vacated child
+       rectangle.  Repaint the frame and every child immediately so a dock
+       operation cannot show a stale duplicate list over the new panel. */
+    InvalidateRect(app->hwnd_main, NULL, TRUE);
+    RedrawWindow(app->hwnd_main, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
+                 RDW_FRAME | RDW_UPDATENOW);
 }
 
 static void ui_disable_horizontal_scrollbar(HWND hwndList)
