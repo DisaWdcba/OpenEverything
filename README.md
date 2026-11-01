@@ -2,13 +2,26 @@
 
 Everything 的开源复刻版本。
 
+## 下载
+
+最新版本：[OpenEverything v2.3.4](https://github.com/DisaWdcba/OpenEverything/releases/latest)
+
+| 文件 | 说明 |
+| --- | --- |
+| `OpenEverything-v2.3.4-Setup-win64.exe` | 推荐。内嵌 GUI、CLI 和索引服务的单文件安装器，双击安装 |
+| `OpenEverything-v2.3.4-GUI-win64.zip` | 免安装 GUI 包，解压后运行 `OpenEverything.exe` |
+| `OpenEverything-v2.3.4-CLI-win64.zip` | 免安装 CLI/MCP 包，解压后运行 `OpenEverythingCLI.exe` |
+| `SHA256SUMS.txt` | 发布文件的 SHA-256 校验值 |
+
+系统要求：Windows 10/11 x64。首次启动需要管理员权限以建立 NTFS 索引；安装服务后，日常查询和 CLI/MCP 调用使用普通用户权限。
+
 ## V2.3.4 新功能
 
 - **运行时语言切换**：视图 → 语言，默认内置简体中文和 English，可随时切换，无需重启。语言表保存在 `%LOCALAPPDATA%\OpenEverything\languages.ini`，该文件缺失或损坏时内置中英文仍然可用。
 - **File 菜单**：新增“新建搜索窗口”（Ctrl+N，可在主界面多开）；选中文件后提供打开、打开路径、复制完整名称、删除、重命名、属性，并全部支持热键。
 - **View 菜单**：详细信息 / 中等缩略图 / 大缩略图 / 超大缩略图（默认详细信息）；状态栏可勾选折叠（与筛选器同级）；排序方式支持字段、扩展名以及升序/降序。
 - **Help → 命令行选项**：完整的 Everything 兼容参数表，并与 OpenEverything 已有的 `search`/`stats`/`update`/`mcp` 命令合并。
-- **右键菜单修复**：文件和文件夹现在都有“重命名”（F2）。
+- **右键菜单**：不再重复系统项；“打开 / 重命名 / 删除 / 属性”由系统菜单提供（通过 `CMF_CANRENAME` 启用重命名），另外保留“打开路径”和“复制完整名称到剪贴板”。
 - **匹配高亮**：结果中与输入匹配的部分以黑色加粗显示。
 - **托盘**：通知区域图标，支持显示/隐藏窗口、新建搜索窗口、关闭到托盘、最小化到托盘和退出。
 
@@ -203,4 +216,6 @@ build\OpenEverythingCLI.exe stats --json
 
 ## GitHub
 
-https://github.com/DisaWdcba
+- 仓库：https://github.com/DisaWdcba/OpenEverything
+- 发布：https://github.com/DisaWdcba/OpenEverything/releases
+- 当前版本：v2.3.4
