@@ -126,6 +126,13 @@
 #define COL_EXTENSION                    6
 
 /* Menu command IDs */
+#define IDM_FILE_NEW_WINDOW              10002
+#define IDM_FILE_OPEN                    10003
+#define IDM_FILE_OPEN_PATH               10004
+#define IDM_FILE_COPY_FULL_NAME          10005
+#define IDM_FILE_DELETE                  10006
+#define IDM_FILE_RENAME                  10007
+#define IDM_FILE_PROPERTIES              10008
 #define IDM_FILE_EXIT                    10001
 #define IDM_EDIT_COPY                    10010
 #define IDM_EDIT_COPY_PATH               10011
@@ -143,13 +150,36 @@
 #define IDM_VIEW_SORT_ATTRIBUTES         10045
 #define IDM_VIEW_FOLDERS                 10046
 #define IDM_VIEW_FILTERS                 10047
+#define IDM_VIEW_SORT_EXTENSION          10048
+#define IDM_VIEW_STATUS_BAR              10049
+#define IDM_VIEW_SORT_ASCENDING          10080
+#define IDM_VIEW_SORT_DESCENDING         10081
 #define IDM_VIEW_THEME_LIGHT             10090
 #define IDM_VIEW_THEME_DARK              10091
 #define IDM_VIEW_THEME_SYSTEM            10092
+#define IDM_VIEW_DETAILS                 10100
+#define IDM_VIEW_THUMBNAILS_MEDIUM       10101
+#define IDM_VIEW_THUMBNAILS_LARGE        10102
+#define IDM_VIEW_THUMBNAILS_EXTRA_LARGE  10103
+#define IDM_VIEW_CLOSE_TO_TRAY           10110
+#define IDM_VIEW_MINIMIZE_TO_TRAY        10111
+#define IDM_VIEW_LANGUAGE_RELOAD         10118
+#define IDM_VIEW_CHOOSE_LANGUAGE         10119
+#define IDM_VIEW_LANGUAGE_FIRST          10120
+#define IDM_VIEW_LANGUAGE_LAST           10151
 #define IDM_INDEX_UPDATE                 10050
 #define IDM_INDEX_REBUILD                10051
+#define IDM_HELP_CMDLINE                 10061
 #define IDM_HELP_ABOUT                   10060
 #define ID_TOOLBAR_REFRESH               11001
+#define IDM_TRAY_SHOW                    10160
+#define IDM_TRAY_HIDE                    10161
+#define IDM_TRAY_NEW_WINDOW              10162
+#define IDM_TRAY_EXIT                    10163
+#define IDM_TRAY_CLOSE_TO_TRAY           10164
+#define IDM_TRAY_MINIMIZE_TO_TRAY        10165
+
+#define WM_TRAYICON                      (WM_USER + 200)
 
 typedef enum {
     FILTER_EVERYTHING = 0,
@@ -173,6 +203,13 @@ typedef enum {
     PANEL_DOCK_LEFT = 0,
     PANEL_DOCK_RIGHT
 } PANEL_DOCK_SIDE;
+
+typedef enum {
+    VIEWMODE_DETAILS = 0,
+    VIEWMODE_MEDIUM_THUMBNAILS,
+    VIEWMODE_LARGE_THUMBNAILS,
+    VIEWMODE_EXTRA_LARGE_THUMBNAILS
+} VIEW_MODE;
 
 /* IPC constants */
 #define IPC_PIPE_NAME                   L"\\\\.\\pipe\\OpenEverything"
@@ -549,6 +586,8 @@ typedef struct {
     int show_folders;
     int show_filters;
     int theme_mode;
+    int view_mode;
+    int show_status_bar;
     int sidebar_width;
     int sidebar_split_percent;
     int folder_panel_width;
@@ -569,6 +608,18 @@ typedef struct {
     int window_maximized;
     int sort_column;
     int sort_ascending;
+
+    /* Runtime UI state that is not persisted directly. */
+    wchar_t language[32];
+    int secondary_window;
+    int force_exit;
+    int topmost;
+    int start_reindex;
+    int show_cmdhelp_on_start;
+    int show_language_on_start;
+    int focus_results_on_start;
+    wchar_t initial_search[512];
+    wchar_t initial_select[260];
 } APP_STATE;
 
 extern APP_STATE g_app;

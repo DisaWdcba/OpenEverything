@@ -7,3 +7,10 @@ build/
 *.user
 .vs/
 
+# Local runtime data produced by the indexer / GUI.
+Everything.db
+Everything.ini
+Run History.csv
+debug.log
+src_2/
+

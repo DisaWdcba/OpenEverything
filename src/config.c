@@ -1,5 +1,15 @@
 #include "config.h"
 
+static wchar_t g_config_override[MAX_PATH];
+
+void config_set_path_override(const wchar_t *path)
+{
+    if (path && path[0])
+        wcsncpy_s(g_config_override, MAX_PATH, path, _TRUNCATE);
+    else
+        g_config_override[0] = L'\0';
+}
+
 void config_get_path(wchar_t *buf, size_t size)
 {
     wchar_t appdata[MAX_PATH];
@@ -10,11 +20,25 @@ void config_get_path(wchar_t *buf, size_t size)
     /* _snwprintf_s truncates; swprintf_s would invoke the invalid parameter
        handler and kill the process when LOCALAPPDATA is long enough that the
        joined path overflows the caller's MAX_PATH buffer. */
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata))) {
+    if (g_config_override[0]) {
+        wcsncpy_s(buf, size, g_config_override, _TRUNCATE);
+    } else if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata))) {
         _snwprintf_s(buf, size, _TRUNCATE, L"%s\\OpenEverything\\config.ini", appdata);
     } else {
         wcsncpy_s(buf, size, L"config.ini", _TRUNCATE);
     }
+}
+
+void config_get_dir(wchar_t *buf, size_t size)
+{
+    if (!buf || size == 0)
+        return;
+    config_get_path(buf, size);
+    wchar_t *last = wcsrchr(buf, L'\\');
+    if (last)
+        *last = L'\0';
+    else
+        wcsncpy_s(buf, size, L".", _TRUNCATE);
 }
 
 static int config_read_int(const wchar_t *path, const wchar_t *section,
@@ -46,19 +70,34 @@ static void config_write_int(const wchar_t *path, const wchar_t *section,
     WritePrivateProfileStringW(section, key, buf, path);
 }
 
+static void config_read_string(const wchar_t *path, const wchar_t *section,
+                               const wchar_t *key, const wchar_t *default_val,
+                               wchar_t *buf, size_t buf_size)
+{
+    if (!buf || buf_size == 0)
+        return;
+    GetPrivateProfileStringW(section, key, default_val ? default_val : L"",
+                             buf, (DWORD)buf_size, path);
+}
+
+/* The saved language id is resolved to a live language by main.c after
+   lang_init(); config.c stays free of the GUI localisation table so the CLI
+   and service can keep linking the shared config object. */
+static void config_apply_language(APP_STATE *app, const wchar_t *path)
+{
+    config_read_string(path, L"UI", L"Language", L"",
+                       app->language, 32);
+}
+
 void config_load(APP_STATE *app)
 {
     wchar_t path[MAX_PATH];
+    wchar_t dir[MAX_PATH];
     config_get_path(path, MAX_PATH);
     
     /* Create directory if needed */
-    wchar_t dir[MAX_PATH];
-    wcscpy_s(dir, MAX_PATH, path);
-    wchar_t *last = wcsrchr(dir, L'\\');
-    if (last) {
-        *last = L'\0';
-        SHCreateDirectoryExW(NULL, dir, NULL);
-    }
+    config_get_dir(dir, MAX_PATH);
+    SHCreateDirectoryExW(NULL, dir, NULL);
     
     app->match_case = config_read_int(path, L"Search", L"MatchCase", 0);
     app->match_whole_word = config_read_int(path, L"Search", L"MatchWholeWord", 0);
@@ -74,6 +113,8 @@ void config_load(APP_STATE *app)
     app->column_width_extension = config_read_int(path, L"Columns", L"Extension", 100);
     app->show_folders = config_read_int(path, L"View", L"Folders", 0) != 0;
     app->show_filters = config_read_int(path, L"View", L"Filters", 0) != 0;
+    app->show_status_bar = config_read_int(path, L"View", L"StatusBar", 1) != 0;
+    app->view_mode = config_read_int(path, L"View", L"ViewMode", VIEWMODE_DETAILS);
     app->theme_mode = config_read_int(path, L"View", L"Theme", THEME_SYSTEM);
     app->sidebar_width = config_read_int(path, L"View", L"SidebarWidth", 280);
     app->sidebar_split_percent = config_read_int(path, L"View", L"SidebarSplit", 65);
@@ -95,6 +136,9 @@ void config_load(APP_STATE *app)
     if (app->column_width_extension < 40) app->column_width_extension = 100;
     if (app->theme_mode < THEME_SYSTEM || app->theme_mode > THEME_DARK)
         app->theme_mode = THEME_SYSTEM;
+    if (app->view_mode < VIEWMODE_DETAILS ||
+        app->view_mode > VIEWMODE_EXTRA_LARGE_THUMBNAILS)
+        app->view_mode = VIEWMODE_DETAILS;
     if (app->sidebar_width < 180 || app->sidebar_width > 600)
         app->sidebar_width = 280;
     if (app->sidebar_split_percent < 30 || app->sidebar_split_percent > 80)
@@ -129,8 +173,10 @@ void config_load(APP_STATE *app)
 
     app->sort_column = config_read_int(path, L"View", L"SortColumn", COL_NAME);
     app->sort_ascending = config_read_int(path, L"View", L"SortAscending", 1) != 0;
-    if (app->sort_column < COL_NAME || app->sort_column > COL_ATTRIBUTES)
+    if (app->sort_column < COL_NAME || app->sort_column > COL_EXTENSION)
         app->sort_column = COL_NAME;
+
+    config_apply_language(app, path);
 
     /* Apply to query */
     app->query.match_case = app->match_case;
@@ -155,6 +201,7 @@ void config_save(APP_STATE *app)
     config_write_int(path, L"Search", L"UseRegex", app->use_regex);
     config_write_int(path, L"UI", L"CloseToTray", app->close_to_tray);
     config_write_int(path, L"UI", L"MinimizeToTray", app->minimize_to_tray);
+    WritePrivateProfileStringW(L"UI", L"Language", app->language, path);
     config_write_int(path, L"Columns", L"Name", app->column_width_name);
     config_write_int(path, L"Columns", L"Path", app->column_width_path);
     config_write_int(path, L"Columns", L"Size", app->column_width_size);
@@ -163,6 +210,8 @@ void config_save(APP_STATE *app)
     config_write_int(path, L"Columns", L"Extension", app->column_width_extension);
     config_write_int(path, L"View", L"Folders", app->show_folders);
     config_write_int(path, L"View", L"Filters", app->show_filters);
+    config_write_int(path, L"View", L"StatusBar", app->show_status_bar);
+    config_write_int(path, L"View", L"ViewMode", app->view_mode);
     config_write_int(path, L"View", L"Theme", app->theme_mode);
     config_write_int(path, L"View", L"SidebarWidth", app->sidebar_width);
     config_write_int(path, L"View", L"SidebarSplit", app->sidebar_split_percent);

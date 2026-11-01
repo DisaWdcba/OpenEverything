@@ -1,10 +1,54 @@
-# OpenEverything v0.2.3 SP2
+# OpenEverything v2.3.4
 
 Everything 的开源复刻版本。
+
+## V2.3.4 新功能
+
+- **运行时语言切换**：视图 → 语言，默认内置简体中文和 English，可随时切换，无需重启。语言表保存在 `%LOCALAPPDATA%\OpenEverything\languages.ini`，该文件缺失或损坏时内置中英文仍然可用。
+- **File 菜单**：新增“新建搜索窗口”（Ctrl+N，可在主界面多开）；选中文件后提供打开、打开路径、复制完整名称、删除、重命名、属性，并全部支持热键。
+- **View 菜单**：详细信息 / 中等缩略图 / 大缩略图 / 超大缩略图（默认详细信息）；状态栏可勾选折叠（与筛选器同级）；排序方式支持字段、扩展名以及升序/降序。
+- **Help → 命令行选项**：完整的 Everything 兼容参数表，并与 OpenEverything 已有的 `search`/`stats`/`update`/`mcp` 命令合并。
+- **右键菜单修复**：文件和文件夹现在都有“重命名”（F2）。
+- **匹配高亮**：结果中与输入匹配的部分以黑色加粗显示。
+- **托盘**：通知区域图标，支持显示/隐藏窗口、新建搜索窗口、关闭到托盘、最小化到托盘和退出。
 
 ## 原理
 
 OpenEverything 使用 NTFS MFT/USN Journal 建立本地文件索引，并通过 Win32 原生界面提供快速文件搜索体验。首次运行会建立索引并写入本地缓存，后续启动优先读取缓存。
+
+## 热键
+
+| 操作 | 热键 |
+| --- | --- |
+| 新建搜索窗口 | Ctrl+N |
+| 打开 | Enter |
+| 打开路径 | Ctrl+Enter |
+| 复制完整名称 | Ctrl+Shift+C |
+| 删除 | Del |
+| 重命名 | F2 |
+| 属性 | Alt+Enter |
+| 刷新 | F5 |
+
+## 语言文件
+
+`%LOCALAPPDATA%\OpenEverything\languages.ini` 为可选文件，UTF-8（可带 BOM）或 UTF-16 编码：
+
+```ini
+[Languages]
+en=English
+zh-CN=简体中文
+ja=日本語
+
+[ja]
+File=ファイル
+Open=開く
+New Search Window=新しい検索ウィンドウ
+```
+
+- `[Languages]` 中的 `语言ID=显示名称` 用于控制“视图 → 语言”子菜单。
+- 每个非 `[Languages]` 段落定义一种语言；键是英文 UI 文本（必须与内置英文完全一致），值是该语言的翻译。
+- 缺少的键会回退到英文；文件不存在时仍保留简体中文和 English。
+- 修改后可用“视图 → 语言 → 重新加载语言文件”立即生效。
 
 ## 构建
 
