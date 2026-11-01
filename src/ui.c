@@ -7,7 +7,10 @@
 #include "index.h"
 #include "cache.h"
 #include "resource.h"
+#include "lang.h"
+#include "cmdhelp.h"
 #include <dwmapi.h>
+#include <shobjidl.h>
 
 /* Window procedure */
 static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -32,10 +35,19 @@ static HWND g_hwndSubfolders;
 static HWND g_hwndFilterHeader;
 static HWND g_hwndFilterList;
 static HMENU g_menu_view;
+static HMENU g_menu_file;
+static HMENU g_menu_sort;
+static HMENU g_menu_language;
 static HMENU g_menu_theme;
 static APP_STATE *g_app_ptr;
 static HFONT g_font_ui;
 static HFONT g_font_search;
+static HFONT g_font_bold;
+static HIMAGELIST g_image_small;
+static HACCEL g_accel;
+static int g_tray_added;
+static int g_secondary_offset;
+static HICON g_tray_icon;
 /* The menu bar is laid out by Windows using the system menu font.  Keep a
    separate handle for UAH dark-mode drawing so a large content font cannot
    make top-level menu labels run into each other. */
@@ -104,6 +116,20 @@ static ICON_CACHE_ENTRY *g_icon_cache;
 static int g_icon_cache_count;
 static int g_icon_cache_capacity;
 
+/* Thumbnail cache.  Row images are generated on demand from the shell and
+   kept in an image list, keyed by full path.  A full clear on overflow keeps
+   the memory ceiling predictable for the extra-large 256 px mode. */
+typedef struct {
+    wchar_t *path;
+    int image;
+} THUMB_ENTRY;
+
+static THUMB_ENTRY *g_thumbs;
+static int g_thumb_count;
+static int g_thumb_capacity;
+static HIMAGELIST g_thumb_images;
+static int g_thumb_pixels;
+
 #define UI_SEARCH_TOP 4
 #define UI_SEARCH_HEIGHT 40
 #define UI_SPLITTER_SIZE 6
@@ -118,6 +144,9 @@ static int g_icon_cache_capacity;
 #define IDM_CTX_OPEN_PATH 20002
 #define IDM_CTX_COPY_FULL_NAME 20003
 #define IDM_CTX_SET_RUN_COUNT 20004
+#define IDM_CTX_RENAME 20005
+#define IDM_CTX_DELETE 20006
+#define IDM_CTX_PROPERTIES 20007
 #define IDM_CTX_SHELL_FIRST 21000
 #define IDM_CTX_SHELL_LAST 24000
 #define WM_UAHDRAWMENU 0x0091
@@ -228,6 +257,30 @@ static int usn_sync_once(APP_STATE *app, int *needs_rebuild, int *changed_count)
 static INDEX_ENTRY *ui_entry_from_row(APP_STATE *app, int row);
 static void ui_get_parent_path(APP_STATE *app, int entry_index,
                                wchar_t *buf, size_t buf_size);
+static void ui_build_menu(HWND hwnd);
+static void ui_update_file_menu(void);
+static int ui_selected_row(void);
+static void ui_open_new_search_window(HWND hwnd);
+static void ui_delete_selected(HWND hwnd, APP_STATE *app, int row);
+static void ui_rename_selected(HWND hwnd, APP_STATE *app, int row);
+static void ui_show_properties(HWND hwnd, APP_STATE *app, int row);
+static void ui_apply_view_mode(HWND hwnd);
+static int ui_view_mode_pixels(int mode);
+static int ui_thumb_image_for_path(const wchar_t *path);
+static void ui_clear_thumb_cache(void);
+static LRESULT ui_custom_draw_list_item(NMLVCUSTOMDRAW *draw);
+static void ui_refresh_language(HWND hwnd);
+static void ui_choose_language(HWND hwnd);
+static int ui_prompt_text(HWND owner, const wchar_t *title,
+                          const wchar_t *label, const wchar_t *initial,
+                          wchar_t *out, size_t out_capacity);
+static void ui_tray_add(HWND hwnd);
+static void ui_tray_remove(void);
+static void ui_tray_menu(HWND hwnd);
+static void ui_show_window(HWND hwnd);
+static void ui_hide_to_tray(HWND hwnd);
+static void ui_select_initial_result(APP_STATE *app);
+static int ui_find_text_ci(const wchar_t *haystack, const wchar_t *needle);
 
 /* Reindex context */
 struct ReindexCtx {
@@ -290,6 +343,21 @@ static void ui_init_visual_resources(void)
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     }
 
+    if (!g_font_bold) {
+        LOGFONTW logfont;
+        memset(&logfont, 0, sizeof(logfont));
+        if (g_font_ui && GetObjectW(g_font_ui, sizeof(logfont), &logfont)) {
+            logfont.lfWeight = FW_BOLD;
+            g_font_bold = CreateFontIndirectW(&logfont);
+        }
+        if (!g_font_bold) {
+            g_font_bold = CreateFontW(
+                -16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+    }
+
     if (!g_font_menu) {
         if (have_nonclient_metrics)
             g_font_menu = CreateFontIndirectW(&metrics.lfMenuFont);
@@ -310,12 +378,20 @@ static void ui_free_visual_resources(void)
     }
     g_font_ui = NULL;
     if (g_font_search) { DeleteObject(g_font_search); g_font_search = NULL; }
+    if (g_font_bold) { DeleteObject(g_font_bold); g_font_bold = NULL; }
     if (g_font_menu && g_font_menu != GetStockObject(DEFAULT_GUI_FONT)) {
         DeleteObject(g_font_menu);
     }
     g_font_menu = NULL;
     if (g_brush_window) { DeleteObject(g_brush_window); g_brush_window = NULL; }
     if (g_brush_panel) { DeleteObject(g_brush_panel); g_brush_panel = NULL; }
+    ui_clear_thumb_cache();
+    if (g_thumb_images) {
+        if (g_hwndList)
+            ListView_SetImageList(g_hwndList, NULL, LVSIL_NORMAL);
+        ImageList_Destroy(g_thumb_images);
+        g_thumb_images = NULL;
+    }
     ui_clear_icon_cache();
 }
 
@@ -360,6 +436,7 @@ static void ui_init_system_icons(HWND hwndList)
         SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
     if (images) {
         ListView_SetImageList(hwndList, images, LVSIL_SMALL);
+        g_image_small = images;
         g_icon_folder = sfi.iIcon;
     }
     
@@ -855,7 +932,7 @@ static int ui_append_shell_context_menu(HWND hwnd, HMENU menu, const wchar_t *pa
                                              GetMenuItemCount(menu),
                                              IDM_CTX_SHELL_FIRST,
                                              IDM_CTX_SHELL_LAST,
-                                             CMF_NORMAL);
+                                             CMF_NORMAL | CMF_CANRENAME);
     if (FAILED(hr)) {
         shell_menu->lpVtbl->Release(shell_menu);
         return 0;
@@ -1043,6 +1120,12 @@ static void ui_start_search(HWND hwnd)
     
     if (!app || InterlockedCompareExchange(&g_search_running, 1, 0) != 0)
         return;
+
+    /* A new result set must not inherit the previous rows' selection state:
+       ListView keeps item state across ListView_SetItemCountEx, which made a
+       fresh search look as if every row had been selected. */
+    if (g_hwndList)
+        ListView_SetItemState(g_hwndList, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     
     memset(&next_query, 0, sizeof(next_query));
     GetWindowTextW(g_hwndSearch, next_query.text, 512);
@@ -1098,7 +1181,7 @@ static void ui_start_search(HWND hwnd)
     job->app = app;
     job->hwnd = hwnd;
     app->is_searching = 1;
-    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Searching...");
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("Searching..."));
     
     thread = CreateThread(NULL, 0, search_thread_proc, job, 0, NULL);
     if (thread) {
@@ -1137,8 +1220,10 @@ static void ui_queue_filter_search(HWND hwnd)
     app->filtered_identity = 0;
     app->filtered_stale = 0;
     LeaveCriticalSection(&app->index_lock);
+    if (g_hwndList)
+        ListView_SetItemState(g_hwndList, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     ui_update_listview(g_hwndList, app);
-    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Searching...");
+    SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("Searching..."));
 
     if (InterlockedCompareExchange(&g_search_running, 0, 0) == 0)
         ui_start_search(hwnd);
@@ -1443,6 +1528,13 @@ int ui_init(HINSTANCE hInst)
     return 1;
 }
 
+int ui_translate_accelerator(HWND hwnd, MSG *msg)
+{
+    if (!g_accel || !msg)
+        return 0;
+    return TranslateAcceleratorW(hwnd, g_accel, msg) ? 1 : 0;
+}
+
 /* =============================================================
  * Create main window
  * ============================================================= */
@@ -1469,7 +1561,7 @@ HWND ui_create_main_window(HINSTANCE hInst, int nCmdShow, APP_STATE *app)
     g_app_ptr = app;
     app->hinst = hInst;
 
-    if (app->window_width > 0 && app->window_height > 0) {
+    if (!app->secondary_window && app->window_width > 0 && app->window_height > 0) {
         int saved_w = ui_scale(app->window_width);
         int saved_h = ui_scale(app->window_height);
         if (ui_placement_is_visible(app->window_x, app->window_y,
@@ -1478,6 +1570,31 @@ HWND ui_create_main_window(HINSTANCE hInst, int nCmdShow, APP_STATE *app)
             y = app->window_y;
             width = saved_w;
             height = saved_h;
+        }
+    }
+    if (app->secondary_window) {
+        /* Cascade relative to an existing search window.  Each window is a
+           separate process here, so a process-local counter alone would put
+           every new window at the same place. */
+        HWND existing = FindWindowW(WC_EVERYTHING, NULL);
+        RECT existing_rect;
+        RECT work;
+
+        width = ui_scale(DEFAULT_WINDOW_WIDTH);
+        height = ui_scale(DEFAULT_WINDOW_HEIGHT);
+        if (existing && GetWindowRect(existing, &existing_rect)) {
+            x = existing_rect.left + ui_scale(32);
+            y = existing_rect.top + ui_scale(32);
+        } else {
+            g_secondary_offset += 32;
+            x = ui_scale(80 + g_secondary_offset);
+            y = ui_scale(60 + g_secondary_offset);
+        }
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+            if (x + width > work.right)
+                x = work.left;
+            if (y + height > work.bottom)
+                y = work.top;
         }
     }
 
@@ -1493,6 +1610,12 @@ HWND ui_create_main_window(HINSTANCE hInst, int nCmdShow, APP_STATE *app)
     if (!hwnd) return NULL;
 
     app->hwnd_main = hwnd;
+    if (app->secondary_window) {
+        wchar_t title[160];
+        swprintf_s(title, 160, L"OpenEverything - %s",
+                   L("New Search Window"));
+        SetWindowTextW(hwnd, title);
+    }
     if (app->window_maximized && nCmdShow != SW_SHOWMINIMIZED)
         nCmdShow = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd, nCmdShow);
@@ -1529,11 +1652,12 @@ void ui_update_status(HWND hwndStatus, APP_STATE *app)
     ui_format_count(total, 48, app->entry_count);
     
     if (app->entry_count == 0 && app->index_error_count > 0) {
-        swprintf_s(buf, 256, L"0 objects - unable to read NTFS volumes; try running as Administrator");
+        swprintf_s(buf, 256,
+                   L("0 objects - unable to read NTFS volumes; try running as Administrator"));
     } else if (app->filtered_count == app->entry_count) {
-        swprintf_s(buf, 256, L"%s objects", total);
+        swprintf_s(buf, 256, L("%s objects"), total);
     } else {
-        swprintf_s(buf, 256, L"%s objects (%s total)", filtered, total);
+        swprintf_s(buf, 256, L("%s objects (%s total)"), filtered, total);
     }
     SendMessageW(hwndStatus, SB_SETTEXTW, 0, (LPARAM)buf);
 }
@@ -1588,7 +1712,7 @@ static void ui_populate_folder_roots(void)
         TreeView_SetImageList(g_hwndFolderTree, images, TVSIL_NORMAL);
         g_tree_folder_icon = sfi.iIcon;
     }
-    root = ui_tree_insert(TVI_ROOT, L"Everything",
+    root = ui_tree_insert(TVI_ROOT, L("Everything"),
                           ui_folder_node_new(L"", 1), g_tree_folder_icon, 1);
     drive = drives;
     if (GetLogicalDriveStringsW(512, drives)) {
@@ -1745,18 +1869,59 @@ static int ui_system_theme_is_dark(void)
 
 static void ui_update_view_menu(void)
 {
-    if (!g_menu_view || !g_app_ptr)
+    APP_STATE *app = g_app_ptr;
+    int view_id;
+
+    if (!g_menu_view || !app)
         return;
     CheckMenuItem(g_menu_view, IDM_VIEW_FOLDERS,
-                  MF_BYCOMMAND | (g_app_ptr->show_folders ? MF_CHECKED : MF_UNCHECKED));
+                  MF_BYCOMMAND | (app->show_folders ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu_view, IDM_VIEW_FILTERS,
-                  MF_BYCOMMAND | (g_app_ptr->show_filters ? MF_CHECKED : MF_UNCHECKED));
+                  MF_BYCOMMAND | (app->show_filters ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu_view, IDM_VIEW_STATUS_BAR,
+                  MF_BYCOMMAND | (app->show_status_bar ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu_view, IDM_VIEW_CLOSE_TO_TRAY,
+                  MF_BYCOMMAND | (app->close_to_tray ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu_view, IDM_VIEW_MINIMIZE_TO_TRAY,
+                  MF_BYCOMMAND | (app->minimize_to_tray ? MF_CHECKED : MF_UNCHECKED));
     if (g_menu_theme)
         CheckMenuRadioItem(g_menu_theme, IDM_VIEW_THEME_LIGHT, IDM_VIEW_THEME_SYSTEM,
-                           g_app_ptr->theme_mode == THEME_LIGHT ? IDM_VIEW_THEME_LIGHT :
-                           g_app_ptr->theme_mode == THEME_DARK ? IDM_VIEW_THEME_DARK :
-                                                                  IDM_VIEW_THEME_SYSTEM,
+                           app->theme_mode == THEME_LIGHT ? IDM_VIEW_THEME_LIGHT :
+                           app->theme_mode == THEME_DARK ? IDM_VIEW_THEME_DARK :
+                                                           IDM_VIEW_THEME_SYSTEM,
                            MF_BYCOMMAND);
+
+    switch (app->view_mode) {
+    case VIEWMODE_MEDIUM_THUMBNAILS: view_id = IDM_VIEW_THUMBNAILS_MEDIUM; break;
+    case VIEWMODE_LARGE_THUMBNAILS: view_id = IDM_VIEW_THUMBNAILS_LARGE; break;
+    case VIEWMODE_EXTRA_LARGE_THUMBNAILS: view_id = IDM_VIEW_THUMBNAILS_EXTRA_LARGE; break;
+    default: view_id = IDM_VIEW_DETAILS; break;
+    }
+    CheckMenuRadioItem(g_menu_view, IDM_VIEW_DETAILS,
+                       IDM_VIEW_THUMBNAILS_EXTRA_LARGE, view_id, MF_BYCOMMAND);
+
+    if (g_menu_sort) {
+        int sort_id = IDM_VIEW_SORT_NAME + app->query.sort_column;
+        if (app->query.sort_column == COL_EXTENSION)
+            sort_id = IDM_VIEW_SORT_EXTENSION;
+        CheckMenuRadioItem(g_menu_sort, IDM_VIEW_SORT_NAME,
+                           IDM_VIEW_SORT_EXTENSION, sort_id, MF_BYCOMMAND);
+        CheckMenuRadioItem(g_menu_sort, IDM_VIEW_SORT_ASCENDING,
+                           IDM_VIEW_SORT_DESCENDING,
+                           app->query.sort_ascending ? IDM_VIEW_SORT_ASCENDING :
+                                                       IDM_VIEW_SORT_DESCENDING,
+                           MF_BYCOMMAND);
+    }
+
+    if (g_menu_language) {
+        int count = lang_count();
+        if (count > 0 && count <= IDM_VIEW_LANGUAGE_LAST - IDM_VIEW_LANGUAGE_FIRST + 1) {
+            CheckMenuRadioItem(g_menu_language, IDM_VIEW_LANGUAGE_FIRST,
+                               IDM_VIEW_LANGUAGE_FIRST + count - 1,
+                               IDM_VIEW_LANGUAGE_FIRST + lang_current(),
+                               MF_BYCOMMAND);
+        }
+    }
 }
 
 static void ui_apply_titlebar_theme(HWND hwnd, int dark)
@@ -1916,11 +2081,17 @@ static void ui_apply_layout(HWND hwnd)
     if (!g_hwndSearch || !g_hwndList || !g_hwndStatus)
         return;
     GetClientRect(hwnd, &rc);
-    SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
-    GetWindowRect(g_hwndStatus, &rc_status);
-    status_h = rc_status.bottom - rc_status.top;
-    if (status_h <= 0)
-        status_h = 22;
+    if (app && app->show_status_bar) {
+        ShowWindow(g_hwndStatus, SW_SHOWNA);
+        SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
+        GetWindowRect(g_hwndStatus, &rc_status);
+        status_h = rc_status.bottom - rc_status.top;
+        if (status_h <= 0)
+            status_h = 22;
+    } else {
+        ShowWindow(g_hwndStatus, SW_HIDE);
+        status_h = 0;
+    }
     
     content_bottom = rc.bottom - status_h;
     if (app && app->show_folders && app->show_filters &&
@@ -2103,18 +2274,20 @@ static void ui_update_sort_indicator(HWND hwndList, int column, int ascending)
 
 static void ui_change_sort(HWND hwnd, APP_STATE *app, int column, int toggle_same)
 {
-    if (!app || column < COL_NAME || column > COL_ATTRIBUTES)
+    if (!app || column < COL_NAME || column > COL_EXTENSION)
         return;
 
-    if (toggle_same && app->query.sort_column == column)
+    if (toggle_same == 1 && app->query.sort_column == column) {
         app->query.sort_ascending = !app->query.sort_ascending;
-    else {
+    } else {
         app->query.sort_column = column;
-        app->query.sort_ascending = 1;
+        if (toggle_same != 2)
+            app->query.sort_ascending = 1;
     }
 
     ui_update_sort_indicator(g_hwndList, app->query.sort_column,
                              app->query.sort_ascending);
+    ui_update_view_menu();
     ui_queue_search(hwnd);
 }
 
@@ -2215,8 +2388,1289 @@ static LRESULT ui_custom_draw_list_header(NMCUSTOMDRAW *draw)
 }
 
 /* =============================================================
- * Main window procedure
+ * File actions, menus, language selection and thumbnails
  * ============================================================= */
+
+static int ui_selected_row(void)
+{
+    int row;
+
+    if (!g_hwndList || !g_app_ptr)
+        return -1;
+    row = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
+    if (row < 0 || row >= g_app_ptr->filtered_count)
+        return -1;
+    return row;
+}
+
+static void ui_open_new_search_window(HWND hwnd)
+{
+    wchar_t module[MAX_PATH];
+    wchar_t command[MAX_PATH + 32];
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+
+    (void)hwnd;
+    if (!GetModuleFileNameW(NULL, module, MAX_PATH))
+        return;
+    swprintf_s(command, MAX_PATH + 32, L"\"%s\" -newwindow", module);
+    memset(&startup, 0, sizeof(startup));
+    startup.cb = sizeof(startup);
+    memset(&process, 0, sizeof(process));
+    if (!CreateProcessW(module, command, NULL, NULL, FALSE, 0, NULL, NULL,
+                        &startup, &process)) {
+        MessageBoxW(hwnd, L("Failed to create a new search window."),
+                    L("OpenEverything"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+}
+
+static void ui_delete_selected(HWND hwnd, APP_STATE *app, int row)
+{
+    wchar_t *name = NULL;
+    wchar_t *path = NULL;
+    int is_directory = 0;
+    wchar_t prompt[1024];
+
+    if (!ui_copy_entry_snapshot(app, row, &name, &path, &is_directory))
+        return;
+
+    _snwprintf_s(prompt, 1024, _TRUNCATE, L("Delete \"%s\"?"), name);
+    if (MessageBoxW(hwnd, prompt, L("Delete"),
+                    MB_YESNO | MB_ICONWARNING) == IDYES) {
+        /* pFrom is a list, not a string: the shell scans past the first NUL
+           for the list terminator, so a singly-terminated buffer reads beyond
+           the allocation -- during a delete, no less. */
+        size_t path_len = wcslen(path);
+        wchar_t *op_from = (wchar_t *)calloc(path_len + 2, sizeof(wchar_t));
+        if (op_from) {
+            SHFILEOPSTRUCTW op;
+            int result;
+
+            memcpy(op_from, path, path_len * sizeof(wchar_t));
+            memset(&op, 0, sizeof(op));
+            op.hwnd = hwnd;
+            op.wFunc = FO_DELETE;
+            op.pFrom = op_from;
+            /* Recycle files too, so the same keystroke is undoable for files
+               and folders alike. */
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
+            result = SHFileOperationW(&op);
+            free(op_from);
+            if (result != 0) {
+                wchar_t message[256];
+                swprintf_s(message, 256, L("%s (%d)"),
+                           L("Delete failed"), result);
+                MessageBoxW(hwnd, message, L("Error"), MB_OK | MB_ICONERROR);
+            } else {
+                ui_queue_search(hwnd);
+            }
+        }
+    }
+    free(path);
+    free(name);
+}
+
+static int ui_rename_name_is_valid(const wchar_t *name)
+{
+    if (!name || !name[0])
+        return 0;
+    if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+        return 0;
+    if (wcspbrk(name, L"\\/:*?\"<>|"))
+        return 0;
+    if (name[wcslen(name) - 1] == L' ')
+        return 0;
+    return 1;
+}
+
+static void ui_rename_selected(HWND hwnd, APP_STATE *app, int row)
+{
+    wchar_t *name = NULL;
+    wchar_t *path = NULL;
+    wchar_t new_name[260];
+    wchar_t new_path[SEARCH_FOLDER_SCOPE_MAX * 2];
+    wchar_t *slash;
+    int is_directory = 0;
+
+    if (!ui_copy_entry_snapshot(app, row, &name, &path, &is_directory))
+        return;
+    wcsncpy_s(new_name, 260, name, _TRUNCATE);
+
+    if (!ui_prompt_text(hwnd, L("Rename"), L("New name:"), name,
+                        new_name, 260)) {
+        free(path);
+        free(name);
+        return;
+    }
+    if (_wcsicmp(new_name, name) == 0) {
+        free(path);
+        free(name);
+        return;
+    }
+    if (!ui_rename_name_is_valid(new_name)) {
+        MessageBoxW(hwnd, L("The new name contains invalid characters."),
+                    L("Rename"), MB_OK | MB_ICONWARNING);
+        free(path);
+        free(name);
+        return;
+    }
+
+    wcsncpy_s(new_path, SEARCH_FOLDER_SCOPE_MAX * 2, path, _TRUNCATE);
+    slash = wcsrchr(new_path, L'\\');
+    if (!slash || slash[1] == L'\0') {
+        free(path);
+        free(name);
+        return;
+    }
+    slash[1] = L'\0';
+    if (wcslen(new_path) + wcslen(new_name) + 1 >=
+        SEARCH_FOLDER_SCOPE_MAX * 2) {
+        MessageBoxW(hwnd, L("The new name contains invalid characters."),
+                    L("Rename"), MB_OK | MB_ICONWARNING);
+        free(path);
+        free(name);
+        return;
+    }
+    wcscat_s(new_path, SEARCH_FOLDER_SCOPE_MAX * 2, new_name);
+
+    if (GetFileAttributesW(new_path) != INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(hwnd, L("A file with that name already exists."),
+                    L("Rename"), MB_OK | MB_ICONWARNING);
+    } else if (!MoveFileW(path, new_path)) {
+        wchar_t message[512];
+        swprintf_s(message, 512, L("%s (%lu)"),
+                   L("Failed to rename:"), (unsigned long)GetLastError());
+        MessageBoxW(hwnd, message, L("Rename"), MB_OK | MB_ICONERROR);
+    } else {
+        /* The index catches up through the USN monitor; refresh the visible
+           results now so the renamed row does not linger. */
+        ui_queue_search(hwnd);
+    }
+    free(path);
+    free(name);
+}
+
+static void ui_show_properties(HWND hwnd, APP_STATE *app, int row)
+{
+    wchar_t *path = NULL;
+
+    if (!ui_copy_entry_snapshot(app, row, NULL, &path, NULL))
+        return;
+    if (!SHObjectProperties(hwnd, SHOP_FILEPATH, path, NULL)) {
+        SHELLEXECUTEINFOW info;
+        memset(&info, 0, sizeof(info));
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_INVOKEIDLIST;
+        info.hwnd = hwnd;
+        info.lpVerb = L"properties";
+        info.lpFile = path;
+        info.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&info);
+    }
+    free(path);
+}
+
+/* ---- Simple modal prompt and language chooser ---------------------------- */
+
+#define UI_PROMPT_CLASS   L"OEInputPrompt"
+#define UI_LANGUAGE_CLASS L"OELanguagePrompt"
+
+typedef struct {
+    HWND hwnd;
+    HWND edit;
+    const wchar_t *label;
+    const wchar_t *initial;
+    wchar_t *out;
+    size_t out_capacity;
+    int accepted;
+} PROMPT_BOX;
+
+typedef struct {
+    HWND hwnd;
+    HWND list;
+    int selection;
+    int accepted;
+} LANGUAGE_BOX;
+
+static void ui_register_modal_class(const wchar_t *name, WNDPROC proc)
+{
+    WNDCLASSEXW wc;
+
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = proc;
+    wc.hInstance = g_hInst;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = name;
+    RegisterClassExW(&wc);
+}
+
+static void ui_center_window(HWND hwnd, HWND owner)
+{
+    RECT box;
+    RECT anchor;
+    int x;
+    int y;
+
+    GetWindowRect(hwnd, &box);
+    if (owner && IsWindow(owner) && !IsIconic(owner) &&
+        GetWindowRect(owner, &anchor) &&
+        MonitorFromRect(&anchor, MONITOR_DEFAULTTONULL) != NULL) {
+        x = anchor.left + ((anchor.right - anchor.left) -
+                           (box.right - box.left)) / 2;
+        y = anchor.top + ((anchor.bottom - anchor.top) -
+                          (box.bottom - box.top)) / 2;
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &anchor, 0);
+        x = anchor.left + ((anchor.right - anchor.left) -
+                           (box.right - box.left)) / 2;
+        y = anchor.top + ((anchor.bottom - anchor.top) -
+                          (box.bottom - box.top)) / 2;
+    }
+    SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_SHOWWINDOW);
+}
+
+static LRESULT CALLBACK ui_prompt_wndproc(HWND hwnd, UINT msg,
+                                           WPARAM wParam, LPARAM lParam)
+{
+    PROMPT_BOX *box = (PROMPT_BOX *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE:
+    {
+        CREATESTRUCTW *create = (CREATESTRUCTW *)lParam;
+        RECT rc;
+        int dpi = g_dpi;
+        int pad = MulDiv(16, dpi, 96);
+        int edit_height = MulDiv(26, dpi, 96);
+        int button_width = MulDiv(84, dpi, 96);
+        int button_height = MulDiv(28, dpi, 96);
+
+        box = (PROMPT_BOX *)create->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)box);
+        box->hwnd = hwnd;
+        GetClientRect(hwnd, &rc);
+
+        box->edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", box->initial ? box->initial : L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            pad, pad + MulDiv(18, dpi, 96),
+            rc.right - pad * 2, edit_height,
+            hwnd, (HMENU)1001, g_hInst, NULL);
+        CreateWindowExW(
+            0, L"STATIC", box->label ? box->label : L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pad, pad, rc.right - pad * 2, MulDiv(18, dpi, 96),
+            hwnd, NULL, g_hInst, NULL);
+        CreateWindowExW(
+            0, L"BUTTON", L("OK"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            rc.right - pad - button_width * 2 - MulDiv(8, dpi, 96),
+            rc.bottom - pad - button_height,
+            button_width, button_height,
+            hwnd, (HMENU)IDOK, g_hInst, NULL);
+        CreateWindowExW(
+            0, L"BUTTON", L("Cancel"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            rc.right - pad - button_width,
+            rc.bottom - pad - button_height,
+            button_width, button_height,
+            hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+
+        SendMessageW(box->edit, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SendMessageW(box->edit, EM_SETSEL, 0, -1);
+        SetFocus(box->edit);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (!box)
+            break;
+        if (LOWORD(wParam) == IDOK) {
+            GetWindowTextW(box->edit, box->out, (int)box->out_capacity);
+            box->accepted = box->out[0] != L'\0';
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            box->accepted = 0;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static int ui_prompt_text(HWND owner, const wchar_t *title,
+                          const wchar_t *label, const wchar_t *initial,
+                          wchar_t *out, size_t out_capacity)
+{
+    PROMPT_BOX box;
+    HWND hwnd;
+    MSG msg;
+    int width = MulDiv(430, g_dpi, 96);
+    int height = MulDiv(180, g_dpi, 96);
+
+    if (!out || out_capacity == 0)
+        return 0;
+    out[0] = L'\0';
+    memset(&box, 0, sizeof(box));
+    box.label = label;
+    box.initial = initial;
+    box.out = out;
+    box.out_capacity = out_capacity;
+
+    ui_register_modal_class(UI_PROMPT_CLASS, ui_prompt_wndproc);
+    hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, UI_PROMPT_CLASS, title ? title : L"",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+        owner, NULL, g_hInst, &box);
+    if (!hwnd)
+        return 0;
+
+    ui_center_window(hwnd, owner);
+    if (owner)
+        EnableWindow(owner, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(box.edit);
+
+    while (IsWindow(hwnd)) {
+        BOOL got = GetMessageW(&msg, NULL, 0, 0);
+        if (got == 0 || got == (BOOL)-1)
+            break;
+        if (IsDialogMessageW(hwnd, &msg))
+            continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (owner) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
+    return box.accepted;
+}
+
+static LRESULT CALLBACK ui_language_wndproc(HWND hwnd, UINT msg,
+                                             WPARAM wParam, LPARAM lParam)
+{
+    LANGUAGE_BOX *box = (LANGUAGE_BOX *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE:
+    {
+        CREATESTRUCTW *create = (CREATESTRUCTW *)lParam;
+        RECT rc;
+        int pad = MulDiv(16, g_dpi, 96);
+        int button_width = MulDiv(84, g_dpi, 96);
+        int button_height = MulDiv(28, g_dpi, 96);
+        int i;
+
+        box = (LANGUAGE_BOX *)create->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)box);
+        box->hwnd = hwnd;
+        GetClientRect(hwnd, &rc);
+        CreateWindowExW(
+            0, L"STATIC", L("Select a language:"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pad, pad, rc.right - pad * 2, MulDiv(18, g_dpi, 96),
+            hwnd, NULL, g_hInst, NULL);
+        box->list = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+            LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            pad, pad + MulDiv(24, g_dpi, 96),
+            rc.right - pad * 2,
+            rc.bottom - pad * 2 - button_height - MulDiv(32, g_dpi, 96),
+            hwnd, (HMENU)1002, g_hInst, NULL);
+        for (i = 0; i < lang_count(); i++) {
+            const LANG_ENTRY *entry = lang_entry(i);
+            SendMessageW(box->list, LB_ADDSTRING, 0,
+                         (LPARAM)(entry ? entry->native_name : L""));
+        }
+        SendMessageW(box->list, LB_SETCURSEL, (WPARAM)lang_current(), 0);
+        CreateWindowExW(
+            0, L"BUTTON", L("OK"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            rc.right - pad - button_width * 2 - MulDiv(8, g_dpi, 96),
+            rc.bottom - pad - button_height,
+            button_width, button_height,
+            hwnd, (HMENU)IDOK, g_hInst, NULL);
+        CreateWindowExW(
+            0, L"BUTTON", L("Cancel"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            rc.right - pad - button_width,
+            rc.bottom - pad - button_height,
+            button_width, button_height,
+            hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+        SendMessageW(box->list, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+        SetFocus(box->list);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (!box)
+            break;
+        if (LOWORD(wParam) == IDOK ||
+            (LOWORD(wParam) == 1002 && HIWORD(wParam) == LBN_DBLCLK)) {
+            LRESULT selected = SendMessageW(box->list, LB_GETCURSEL, 0, 0);
+            box->selection = selected >= 0 ? (int)selected : -1;
+            box->accepted = box->selection >= 0;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            box->accepted = 0;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ui_choose_language(HWND owner)
+{
+    LANGUAGE_BOX box;
+    HWND hwnd;
+    MSG msg;
+    int width = MulDiv(360, g_dpi, 96);
+    int height = MulDiv(360, g_dpi, 96);
+
+    memset(&box, 0, sizeof(box));
+    box.selection = -1;
+    ui_register_modal_class(UI_LANGUAGE_CLASS, ui_language_wndproc);
+    hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, UI_LANGUAGE_CLASS, L("Language"),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+        owner, NULL, g_hInst, &box);
+    if (!hwnd)
+        return;
+
+    ui_center_window(hwnd, owner);
+    if (owner)
+        EnableWindow(owner, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+
+    while (IsWindow(hwnd)) {
+        BOOL got = GetMessageW(&msg, NULL, 0, 0);
+        if (got == 0 || got == (BOOL)-1)
+            break;
+        if (IsDialogMessageW(hwnd, &msg))
+            continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (owner) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
+
+    if (box.accepted && box.selection >= 0 && box.selection != lang_current()) {
+        lang_set(box.selection);
+        if (g_app_ptr)
+            wcsncpy_s(g_app_ptr->language, 32, lang_current_id(), _TRUNCATE);
+        ui_refresh_language(owner);
+    }
+}
+
+static void ui_update_file_menu(void)
+{
+    int row;
+    UINT state;
+
+    if (!g_menu_file)
+        return;
+    row = ui_selected_row();
+    state = (row >= 0) ? MF_ENABLED : MF_GRAYED;
+    EnableMenuItem(g_menu_file, IDM_FILE_OPEN, MF_BYCOMMAND | state);
+    EnableMenuItem(g_menu_file, IDM_FILE_OPEN_PATH, MF_BYCOMMAND | state);
+    EnableMenuItem(g_menu_file, IDM_FILE_COPY_FULL_NAME, MF_BYCOMMAND | state);
+    EnableMenuItem(g_menu_file, IDM_FILE_DELETE, MF_BYCOMMAND | state);
+    EnableMenuItem(g_menu_file, IDM_FILE_RENAME, MF_BYCOMMAND | state);
+    EnableMenuItem(g_menu_file, IDM_FILE_PROPERTIES, MF_BYCOMMAND | state);
+}
+
+static void ui_build_menu(HWND hwnd)
+{
+    APP_STATE *app = g_app_ptr;
+    HMENU menu;
+    HMENU file;
+    HMENU edit;
+    HMENU view;
+    HMENU search;
+    HMENU index;
+    HMENU help;
+    HMENU theme;
+    HMENU sort;
+    HMENU language;
+    HMENU old;
+    UINT flags;
+    int i;
+
+    menu = CreateMenu();
+    file = CreatePopupMenu();
+    edit = CreatePopupMenu();
+    view = CreatePopupMenu();
+    search = CreatePopupMenu();
+    index = CreatePopupMenu();
+    help = CreatePopupMenu();
+    theme = CreatePopupMenu();
+    sort = CreatePopupMenu();
+    language = CreatePopupMenu();
+    if (!menu || !file || !edit || !view || !search || !index || !help ||
+        !theme || !sort || !language) {
+        if (menu) DestroyMenu(menu);
+        return;
+    }
+
+    g_menu_view = view;
+    g_menu_file = file;
+    g_menu_theme = theme;
+    g_menu_sort = sort;
+    g_menu_language = language;
+
+    AppendMenuW(file, MF_STRING, IDM_FILE_NEW_WINDOW,
+                L("New Search Window\tCtrl+N"));
+    AppendMenuW(file, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(file, MF_STRING, IDM_FILE_OPEN, L("Open\tEnter"));
+    AppendMenuW(file, MF_STRING, IDM_FILE_OPEN_PATH, L("Open Path\tCtrl+Enter"));
+    AppendMenuW(file, MF_STRING, IDM_FILE_COPY_FULL_NAME,
+                L("Copy Full Name to Clipboard\tCtrl+Shift+C"));
+    AppendMenuW(file, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(file, MF_STRING, IDM_FILE_DELETE, L("Delete\tDel"));
+    AppendMenuW(file, MF_STRING, IDM_FILE_RENAME, L("Rename\tF2"));
+    AppendMenuW(file, MF_STRING, IDM_FILE_PROPERTIES, L("Properties\tAlt+Enter"));
+    AppendMenuW(file, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(file, MF_STRING, IDM_FILE_EXIT, L("Exit\tAlt+F4"));
+
+    AppendMenuW(edit, MF_STRING, IDM_EDIT_COPY, L("Copy\tCtrl+C"));
+    AppendMenuW(edit, MF_STRING, IDM_EDIT_COPY_PATH, L("Copy Full Path\tCtrl+Shift+C"));
+    AppendMenuW(edit, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(edit, MF_STRING, IDM_EDIT_SELECT_ALL, L("Select All\tCtrl+A"));
+
+    AppendMenuW(view, MF_STRING | (app->show_folders ? MF_CHECKED : 0),
+                IDM_VIEW_FOLDERS, L("Folders"));
+    AppendMenuW(view, MF_STRING | (app->show_filters ? MF_CHECKED : 0),
+                IDM_VIEW_FILTERS, L("Filters"));
+    AppendMenuW(view, MF_STRING | (app->show_status_bar ? MF_CHECKED : 0),
+                IDM_VIEW_STATUS_BAR, L("Status Bar"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(view, MF_STRING, IDM_VIEW_DETAILS, L("Details"));
+    AppendMenuW(view, MF_STRING, IDM_VIEW_THUMBNAILS_MEDIUM, L("Medium Thumbnails"));
+    AppendMenuW(view, MF_STRING, IDM_VIEW_THUMBNAILS_LARGE, L("Large Thumbnails"));
+    AppendMenuW(view, MF_STRING, IDM_VIEW_THUMBNAILS_EXTRA_LARGE,
+                L("Extra Large Thumbnails"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(theme, MF_STRING, IDM_VIEW_THEME_LIGHT, L("Light"));
+    AppendMenuW(theme, MF_STRING, IDM_VIEW_THEME_DARK, L("Dark"));
+    AppendMenuW(theme, MF_STRING, IDM_VIEW_THEME_SYSTEM, L("System"));
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)theme, L("Themes"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    flags = app->match_case ? MF_CHECKED : 0;
+    AppendMenuW(view, MF_STRING | flags, IDM_VIEW_MATCH_CASE, L("Match Case"));
+    flags = app->match_whole_word ? MF_CHECKED : 0;
+    AppendMenuW(view, MF_STRING | flags, IDM_VIEW_MATCH_WHOLE_WORD,
+                L("Match Whole Word"));
+    flags = app->match_path ? MF_CHECKED : 0;
+    AppendMenuW(view, MF_STRING | flags, IDM_VIEW_MATCH_PATH, L("Match Path"));
+    flags = app->use_regex ? MF_CHECKED : 0;
+    AppendMenuW(view, MF_STRING | flags, IDM_VIEW_USE_REGEX, L("Use Regex"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_NAME, L("Name"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_PATH, L("Path"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_SIZE, L("Size"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_DATE_MODIFIED, L("Date Modified"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_DATE_CREATED, L("Date Created"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_ATTRIBUTES, L("Attributes"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_EXTENSION, L("Extension"));
+    AppendMenuW(sort, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_ASCENDING, L("Ascending"));
+    AppendMenuW(sort, MF_STRING, IDM_VIEW_SORT_DESCENDING, L("Descending"));
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)sort, L("Sort By"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    for (i = 0; i < lang_count() &&
+                i <= IDM_VIEW_LANGUAGE_LAST - IDM_VIEW_LANGUAGE_FIRST; i++) {
+        const LANG_ENTRY *entry = lang_entry(i);
+        if (entry)
+            AppendMenuW(language, MF_STRING, IDM_VIEW_LANGUAGE_FIRST + i,
+                        entry->native_name);
+    }
+    AppendMenuW(language, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(language, MF_STRING, IDM_VIEW_CHOOSE_LANGUAGE,
+                L("Choose Language..."));
+    AppendMenuW(language, MF_STRING, IDM_VIEW_LANGUAGE_RELOAD,
+                L("Reload Language File"));
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)language, L("Language"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(view, MF_STRING | (app->close_to_tray ? MF_CHECKED : 0),
+                IDM_VIEW_CLOSE_TO_TRAY, L("Close to Tray"));
+    AppendMenuW(view, MF_STRING | (app->minimize_to_tray ? MF_CHECKED : 0),
+                IDM_VIEW_MINIMIZE_TO_TRAY, L("Minimize to Tray"));
+    AppendMenuW(view, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(view, MF_STRING, IDM_VIEW_REFRESH, L("Refresh\tF5"));
+
+    AppendMenuW(search, MF_STRING, 10070, L("Add to Bookmarks..."));
+    AppendMenuW(search, MF_STRING, 10071, L("Organize Filters..."));
+
+    AppendMenuW(index, MF_STRING, IDM_INDEX_UPDATE, L("Update Index"));
+    AppendMenuW(index, MF_STRING, IDM_INDEX_REBUILD, L("Rebuild Index"));
+
+    AppendMenuW(help, MF_STRING, IDM_HELP_CMDLINE, L("Command Line Options"));
+    AppendMenuW(help, MF_STRING, IDM_HELP_ABOUT, L("About OpenEverything"));
+
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)file, L("File"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)edit, L("Edit"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)view, L("View"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)search, L("Search"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)index, L("Index"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)help, L("Help"));
+
+    old = GetMenu(hwnd);
+    if (old) {
+        SetMenu(hwnd, NULL);
+        DestroyMenu(old);
+    }
+    SetMenu(hwnd, menu);
+    ui_update_view_menu();
+
+    if (!g_accel) {
+        ACCEL accelerators[2];
+        accelerators[0].fVirt = FVIRTKEY | FCONTROL;
+        accelerators[0].key = L'N';
+        accelerators[0].cmd = IDM_FILE_NEW_WINDOW;
+        accelerators[1].fVirt = FVIRTKEY;
+        accelerators[1].key = VK_F5;
+        accelerators[1].cmd = IDM_VIEW_REFRESH;
+        g_accel = CreateAcceleratorTableW(accelerators, 2);
+    }
+    DrawMenuBar(hwnd);
+}
+
+static void ui_refresh_language(HWND hwnd)
+{
+    static const wchar_t *columns[] = {
+        L"Name", L"Path", L"Size", L"Date Modified",
+        L"Date Created", L"Attributes", L"Extension"
+    };
+    int i;
+
+    ui_build_menu(hwnd);
+
+    if (g_hwndList) {
+        for (i = 0; i < (int)(sizeof(columns) / sizeof(columns[0])); i++) {
+            LVCOLUMNW column;
+            memset(&column, 0, sizeof(column));
+            column.mask = LVCF_TEXT;
+            column.pszText = (wchar_t *)lang_tr(columns[i]);
+            ListView_SetColumn(g_hwndList, i, &column);
+        }
+    }
+    if (g_hwndFilterList) {
+        SendMessageW(g_hwndFilterList, LB_RESETCONTENT, 0, 0);
+        for (i = 0; i < FILTER_COUNT; i++)
+            SendMessageW(g_hwndFilterList, LB_ADDSTRING, 0,
+                         (LPARAM)lang_tr(g_filter_names[i]));
+        SendMessageW(g_hwndFilterList, LB_SETCURSEL,
+                     g_app_ptr ? g_app_ptr->selected_filter : 0, 0);
+    }
+    if (g_hwndSubfolders)
+        SetWindowTextW(g_hwndSubfolders, L("Subfolders"));
+    if (g_hwndFolderTree) {
+        HTREEITEM root = TreeView_GetRoot(g_hwndFolderTree);
+        if (root) {
+            TVITEMW item;
+            wchar_t text[64];
+            wcsncpy_s(text, 64, L("Everything"), _TRUNCATE);
+            memset(&item, 0, sizeof(item));
+            item.mask = TVIF_TEXT | TVIF_HANDLE;
+            item.hItem = root;
+            item.pszText = text;
+            TreeView_SetItem(g_hwndFolderTree, &item);
+        }
+    }
+    if (g_hwndFolderHeader) InvalidateRect(g_hwndFolderHeader, NULL, TRUE);
+    if (g_hwndFilterHeader) InvalidateRect(g_hwndFilterHeader, NULL, TRUE);
+    if (g_hwndStatus) ui_update_status(g_hwndStatus, g_app_ptr);
+    if (g_hwndList) InvalidateRect(g_hwndList, NULL, TRUE);
+    DrawMenuBar(hwnd);
+}
+
+/* ---- Thumbnails ---------------------------------------------------------- */
+
+static int ui_view_mode_pixels(int mode)
+{
+    switch (mode) {
+    case VIEWMODE_MEDIUM_THUMBNAILS: return 48;
+    case VIEWMODE_LARGE_THUMBNAILS: return 96;
+    case VIEWMODE_EXTRA_LARGE_THUMBNAILS: return 256;
+    default: return 0;
+    }
+}
+
+static void ui_clear_thumb_cache(void)
+{
+    int i;
+
+    for (i = 0; i < g_thumb_count; i++)
+        free(g_thumbs[i].path);
+    free(g_thumbs);
+    g_thumbs = NULL;
+    g_thumb_count = 0;
+    g_thumb_capacity = 0;
+}
+
+static HBITMAP ui_load_thumbnail_bitmap(const wchar_t *path, int pixels)
+{
+    IShellItemImageFactory *factory = NULL;
+    HBITMAP bitmap = NULL;
+    SIZE size;
+    HRESULT result;
+
+    if (!path || !path[0])
+        return NULL;
+    size.cx = pixels;
+    size.cy = pixels;
+    result = SHCreateItemFromParsingName(
+        path, NULL, &IID_IShellItemImageFactory, (void **)&factory);
+    if (SUCCEEDED(result) && factory) {
+        result = factory->lpVtbl->GetImage(
+            factory, size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &bitmap);
+        if (FAILED(result) || !bitmap) {
+            factory->lpVtbl->GetImage(
+                factory, size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &bitmap);
+        }
+        factory->lpVtbl->Release(factory);
+    }
+    return bitmap;
+}
+
+static int ui_thumb_image_for_path(const wchar_t *path)
+{
+    int i;
+    int limit;
+    HBITMAP bitmap;
+    int image;
+    wchar_t *copy;
+
+    if (!path || !path[0] || !g_thumb_images)
+        return 0;
+    for (i = 0; i < g_thumb_count; i++) {
+        if (g_thumbs[i].path && _wcsicmp(g_thumbs[i].path, path) == 0)
+            return g_thumbs[i].image;
+    }
+
+    limit = g_thumb_pixels >= 200 ? 256 : 1024;
+    if (g_thumb_count >= limit)
+        return 0;
+
+    bitmap = ui_load_thumbnail_bitmap(path, g_thumb_pixels);
+    if (!bitmap)
+        return 0;
+    image = ImageList_Add(g_thumb_images, bitmap, NULL);
+    DeleteObject(bitmap);
+    if (image < 0)
+        return 0;
+
+    if (g_thumb_count >= g_thumb_capacity) {
+        int capacity = g_thumb_capacity ? g_thumb_capacity * 2 : 32;
+        THUMB_ENTRY *next = (THUMB_ENTRY *)realloc(
+            g_thumbs, (size_t)capacity * sizeof(THUMB_ENTRY));
+        if (!next)
+            return image;
+        g_thumbs = next;
+        g_thumb_capacity = capacity;
+    }
+    copy = _wcsdup(path);
+    if (copy) {
+        g_thumbs[g_thumb_count].path = copy;
+        g_thumbs[g_thumb_count].image = image;
+        g_thumb_count++;
+    }
+    return image;
+}
+
+static void ui_apply_view_mode(HWND hwnd)
+{
+    APP_STATE *app = g_app_ptr;
+    LONG_PTR style;
+    int pixels;
+
+    if (!app || !g_hwndList)
+        return;
+    style = GetWindowLongPtrW(g_hwndList, GWL_STYLE);
+
+    if (app->view_mode == VIEWMODE_DETAILS) {
+        if ((style & LVS_TYPEMASK) != LVS_REPORT) {
+            style = (style & ~LVS_TYPEMASK) | LVS_REPORT;
+            SetWindowLongPtrW(g_hwndList, GWL_STYLE, style);
+            SetWindowPos(g_hwndList, NULL, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        if (g_thumb_images) {
+            ListView_SetImageList(g_hwndList, NULL, LVSIL_NORMAL);
+            ImageList_Destroy(g_thumb_images);
+            g_thumb_images = NULL;
+        }
+        ui_clear_thumb_cache();
+        ListView_SetImageList(g_hwndList, g_image_small, LVSIL_SMALL);
+    } else {
+        pixels = ui_scale(ui_view_mode_pixels(app->view_mode));
+        if (pixels < 16)
+            pixels = 48;
+        if ((style & LVS_TYPEMASK) != LVS_ICON) {
+            style = (style & ~LVS_TYPEMASK) | LVS_ICON;
+            SetWindowLongPtrW(g_hwndList, GWL_STYLE, style);
+        }
+        if (!g_thumb_images || g_thumb_pixels != pixels) {
+            HICON icon = NULL;
+            SHFILEINFOW info;
+
+            if (g_thumb_images) {
+                ListView_SetImageList(g_hwndList, NULL, LVSIL_NORMAL);
+                ImageList_Destroy(g_thumb_images);
+                g_thumb_images = NULL;
+            }
+            ui_clear_thumb_cache();
+            g_thumb_images = ImageList_Create(pixels, pixels, ILC_COLOR32, 16, 16);
+            g_thumb_pixels = pixels;
+            if (g_thumb_images) {
+                memset(&info, 0, sizeof(info));
+                if (SHGetFileInfoW(L"file", FILE_ATTRIBUTE_NORMAL, &info,
+                                   sizeof(info), SHGFI_ICON | SHGFI_LARGEICON))
+                    icon = info.hIcon;
+                if (icon) {
+                    /* Index 0 is the fallback image for thumbnails that the
+                       shell cannot render. */
+                    ImageList_AddIcon(g_thumb_images, icon);
+                    DestroyIcon(icon);
+                }
+                ListView_SetImageList(g_hwndList, g_thumb_images, LVSIL_NORMAL);
+            }
+        }
+        ListView_SetIconSpacing(g_hwndList, pixels + ui_scale(28),
+                                pixels + ui_scale(46));
+        SetWindowPos(g_hwndList, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    ui_disable_horizontal_scrollbar(g_hwndList);
+    ui_apply_layout(hwnd);
+    InvalidateRect(g_hwndList, NULL, TRUE);
+}
+
+/* ---- Matched-text highlighting ------------------------------------------- */
+
+static int ui_find_text_ci(const wchar_t *haystack, const wchar_t *needle)
+{
+    int i;
+    int j;
+    int case_sensitive;
+
+    if (!haystack || !needle || !needle[0])
+        return -1;
+    case_sensitive = g_app_ptr && g_app_ptr->query.match_case;
+    for (i = 0; haystack[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            wchar_t a = haystack[i + j];
+            wchar_t b = needle[j];
+            if (!a)
+                return -1;
+            if (!case_sensitive) {
+                a = (wchar_t)towlower(a);
+                b = (wchar_t)towlower(b);
+            }
+            if (a != b)
+                break;
+        }
+        if (!needle[j])
+            return i;
+    }
+    return -1;
+}
+
+static void ui_mark_matched_text(const wchar_t *name, int *flags, int count)
+{
+    const wchar_t *query;
+    wchar_t token[160];
+    int length;
+    int i;
+
+    if (!g_app_ptr || !name || !flags || count <= 0)
+        return;
+    query = g_app_ptr->query.text;
+    if (!query || !query[0])
+        return;
+
+    length = 0;
+    for (i = 0; ; i++) {
+        wchar_t ch = query[i];
+        if (ch == L' ' || ch == L'\t' || ch == L'\0') {
+            int start;
+            if (length > 0) {
+                token[length] = L'\0';
+                if (!wcschr(token, L':')) {
+                    start = 0;
+                    for (int k = 0; k <= length; k++) {
+                        if (k == length || token[k] == L'*' || token[k] == L'?') {
+                            if (k > start) {
+                                wchar_t segment[160];
+                                int segment_length = k - start;
+                                const wchar_t *cursor = name;
+                                int found;
+
+                                if (segment_length >= 160)
+                                    segment_length = 159;
+                                wcsncpy_s(segment, 160, token + start,
+                                          (size_t)segment_length);
+                                segment[segment_length] = L'\0';
+                                while ((found = ui_find_text_ci(cursor, segment)) >= 0) {
+                                    int base = (int)(cursor - name) + found;
+                                    for (int m = 0; m < segment_length; m++) {
+                                        if (base + m < count)
+                                            flags[base + m] = 1;
+                                    }
+                                    cursor += found + 1;
+                                }
+                            }
+                            start = k + 1;
+                        }
+                    }
+                }
+                length = 0;
+            }
+            if (ch == L'\0')
+                break;
+        } else if (length < 159) {
+            token[length++] = ch;
+        }
+    }
+}
+
+static LRESULT ui_custom_draw_list_item(NMLVCUSTOMDRAW *draw)
+{
+    APP_STATE *app = g_app_ptr;
+    wchar_t *name = NULL;
+    wchar_t *path = NULL;
+    int is_directory = 0;
+    int flags[512];
+    int name_length;
+    RECT rc;
+    RECT text_rc;
+    HDC dc;
+    HGDIOBJ old_font;
+    TEXTMETRICW metrics;
+    COLORREF normal_color;
+    COLORREF matched_color;
+    HBRUSH background;
+    int selected;
+    int x;
+    int y;
+    int index;
+    int icon_size;
+
+    if (!app || !g_hwndList || app->view_mode != VIEWMODE_DETAILS)
+        return CDRF_DODEFAULT;
+    /* Nothing to highlight before the first query: let the control draw its
+       normal (including selected) rows. */
+    if (!app->query.text[0])
+        return CDRF_DODEFAULT;
+    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
+        return CDRF_NOTIFYITEMDRAW;
+    if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+        return CDRF_NOTIFYSUBITEMDRAW;
+    if ((draw->nmcd.dwDrawStage & CDDS_SUBITEM) == 0 ||
+        (draw->nmcd.dwDrawStage & CDDS_ITEMPREPAINT) == 0 ||
+        draw->iSubItem != COL_NAME)
+        return CDRF_DODEFAULT;
+
+    index = (int)draw->nmcd.dwItemSpec;
+    if (index < 0 || index >= app->filtered_count)
+        return CDRF_DODEFAULT;
+    if (!ui_copy_entry_snapshot(app, index, &name, &path, &is_directory))
+        return CDRF_DODEFAULT;
+
+    name_length = (int)wcslen(name);
+    if (name_length <= 0 || name_length >= 512) {
+        free(path);
+        free(name);
+        return CDRF_DODEFAULT;
+    }
+    memset(flags, 0, sizeof(flags));
+    ui_mark_matched_text(name, flags, 511);
+
+    /* For subitem zero, ListView_GetSubItemRect(...LVIR_BOUNDS) returns the
+       whole row, which let long names paint over the Path column.  Custom
+       draw already hands us the exact subitem rectangle. */
+    rc = draw->nmcd.rc;
+    if (rc.right <= rc.left || rc.bottom <= rc.top) {
+        free(path);
+        free(name);
+        return CDRF_DODEFAULT;
+    }
+
+    dc = draw->nmcd.hdc;
+    /* NMLVCUSTOMDRAW's uItemState is not reliable at the SUBITEM stage on all
+       comctl32 versions (it made every row paint with the selection brush).
+       Query the control so a normal, unselected row stays on the window
+       background. */
+    selected = (ListView_GetItemState(g_hwndList, index, LVIS_SELECTED) &
+                LVIS_SELECTED) != 0;
+    background = CreateSolidBrush(selected ? GetSysColor(COLOR_HIGHLIGHT)
+                                           : g_color_window);
+    FillRect(dc, &rc, background);
+    DeleteObject(background);
+
+    icon_size = GetSystemMetrics(SM_CXSMICON);
+    x = rc.left + 2;
+    if (g_image_small) {
+        wchar_t extension[64];
+        const wchar_t *dot = wcsrchr(name, L'.');
+        extension[0] = L'\0';
+        if (!is_directory && dot && dot[1])
+            wcsncpy_s(extension, 64, dot + 1, _TRUNCATE);
+        ImageList_Draw(g_image_small, ui_icon_for_type(is_directory, extension),
+                       dc, x, rc.top + ((rc.bottom - rc.top) - icon_size) / 2,
+                       ILD_TRANSPARENT);
+    }
+    x += icon_size + 6;
+
+    text_rc = rc;
+    text_rc.left = x;
+    text_rc.right -= 4;
+    SetBkMode(dc, TRANSPARENT);
+    old_font = SelectObject(dc, g_font_ui ? g_font_ui :
+                                GetStockObject(DEFAULT_GUI_FONT));
+    GetTextMetricsW(dc, &metrics);
+    y = rc.top + ((rc.bottom - rc.top) - metrics.tmHeight) / 2;
+    normal_color = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : g_color_text;
+    matched_color = selected ? normal_color :
+                    (g_theme_is_dark ? RGB(255, 255, 255) : RGB(0, 0, 0));
+
+    index = 0;
+    while (index < name_length) {
+        int end = index;
+        int matched = flags[index];
+        SIZE size;
+
+        while (end < name_length && flags[end] == matched)
+            end++;
+        SelectObject(dc, matched && g_font_bold ? g_font_bold : g_font_ui);
+        SetTextColor(dc, matched ? matched_color : normal_color);
+        GetTextExtentPoint32W(dc, name + index, end - index, &size);
+        if (x + size.cx > text_rc.right) {
+            RECT ellipsis_rc = text_rc;
+            SelectObject(dc, g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
+            SetTextColor(dc, normal_color);
+            ellipsis_rc.left = x;
+            DrawTextW(dc, L"...", 3, &ellipsis_rc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            break;
+        }
+        TextOutW(dc, x, y, name + index, end - index);
+        x += size.cx;
+        index = end;
+    }
+    SelectObject(dc, old_font);
+    if (selected && (draw->nmcd.uItemState & CDIS_FOCUS))
+        DrawFocusRect(dc, &rc);
+    free(path);
+    free(name);
+    return CDRF_SKIPDEFAULT;
+}
+
+/* ---- Notification-area icon ---------------------------------------------- */
+
+static void ui_tray_add(HWND hwnd)
+{
+    NOTIFYICONDATAW data;
+
+    if (g_tray_added || !hwnd)
+        return;
+    if (!g_tray_icon) {
+        g_tray_icon = (HICON)LoadImageW(
+            g_hInst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR);
+    }
+    memset(&data, 0, sizeof(data));
+    data.cbSize = sizeof(data);
+    data.hWnd = hwnd;
+    data.uID = 1;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = WM_TRAYICON;
+    data.hIcon = g_tray_icon ? g_tray_icon : LoadIconW(NULL, IDI_APPLICATION);
+    wcsncpy_s(data.szTip, 128, L"OpenEverything", _TRUNCATE);
+    {
+        BOOL added = Shell_NotifyIconW(NIM_ADD, &data);
+        DWORD error = added ? 0 : GetLastError();
+        if (added)
+            g_tray_added = 1;
+        /* Diagnostic/automation hooks: confirm the shell accepted the icon
+           even when the user has placed it in the overflow area. */
+        SetPropW(hwnd, L"OpenEverythingTrayIcon", (HANDLE)(INT_PTR)g_tray_added);
+        SetPropW(hwnd, L"OpenEverythingTrayError", (HANDLE)(INT_PTR)error);
+    }
+}
+
+static void ui_tray_remove(void)
+{
+    NOTIFYICONDATAW data;
+
+    if (g_tray_added && g_app_ptr && g_app_ptr->hwnd_main) {
+        memset(&data, 0, sizeof(data));
+        data.cbSize = sizeof(data);
+        data.hWnd = g_app_ptr->hwnd_main;
+        data.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &data);
+        RemovePropW(g_app_ptr->hwnd_main, L"OpenEverythingTrayIcon");
+        RemovePropW(g_app_ptr->hwnd_main, L"OpenEverythingTrayError");
+    }
+    g_tray_added = 0;
+    if (g_tray_icon) {
+        DestroyIcon(g_tray_icon);
+        g_tray_icon = NULL;
+    }
+}
+
+static void ui_show_window(HWND hwnd)
+{
+    if (!hwnd)
+        return;
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
+
+static void ui_hide_to_tray(HWND hwnd)
+{
+    static int balloon_shown;
+
+    if (!hwnd)
+        return;
+    ShowWindow(hwnd, SW_HIDE);
+    if (!balloon_shown && g_tray_added) {
+        NOTIFYICONDATAW data;
+        memset(&data, 0, sizeof(data));
+        data.cbSize = sizeof(data);
+        data.hWnd = hwnd;
+        data.uID = 1;
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        wcsncpy_s(data.szInfoTitle, 64, L"OpenEverything", _TRUNCATE);
+        wcsncpy_s(data.szInfo, 256,
+                  L("OpenEverything is still running in the notification area."),
+                  _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+        balloon_shown = 1;
+    }
+}
+
+static void ui_tray_menu(HWND hwnd)
+{
+    HMENU menu;
+    POINT point;
+    int command;
+
+    menu = CreatePopupMenu();
+    if (!menu)
+        return;
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SHOW, L("Show Window"));
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_HIDE, L("Hide Window"));
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_NEW_WINDOW,
+                L("New Search Window\tCtrl+N"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_app_ptr && g_app_ptr->close_to_tray
+                                   ? MF_CHECKED : 0),
+                IDM_TRAY_CLOSE_TO_TRAY, L("Close to Tray"));
+    AppendMenuW(menu, MF_STRING | (g_app_ptr && g_app_ptr->minimize_to_tray
+                                   ? MF_CHECKED : 0),
+                IDM_TRAY_MINIMIZE_TO_TRAY, L("Minimize to Tray"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L("Exit"));
+
+    GetCursorPos(&point);
+    SetForegroundWindow(hwnd);
+    command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY |
+                             TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, NULL);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    switch (command) {
+    case IDM_TRAY_SHOW:
+        ui_show_window(hwnd);
+        break;
+    case IDM_TRAY_HIDE:
+        ui_hide_to_tray(hwnd);
+        break;
+    case IDM_TRAY_NEW_WINDOW:
+        ui_open_new_search_window(hwnd);
+        break;
+    case IDM_TRAY_CLOSE_TO_TRAY:
+        if (g_app_ptr) {
+            g_app_ptr->close_to_tray = !g_app_ptr->close_to_tray;
+            ui_update_view_menu();
+        }
+        break;
+    case IDM_TRAY_MINIMIZE_TO_TRAY:
+        if (g_app_ptr) {
+            g_app_ptr->minimize_to_tray = !g_app_ptr->minimize_to_tray;
+            ui_update_view_menu();
+        }
+        break;
+    case IDM_TRAY_EXIT:
+        if (g_app_ptr) {
+            g_app_ptr->force_exit = 1;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        break;
+    }
+}
+
+static void ui_select_initial_result(APP_STATE *app)
+{
+    int i;
+
+    if (!app || !g_hwndList || !app->initial_select[0])
+        return;
+    for (i = 0; i < app->filtered_count; i++) {
+        wchar_t *name = NULL;
+        if (ui_copy_entry_snapshot(app, i, &name, NULL, NULL)) {
+            int match = _wcsicmp(name, app->initial_select) == 0;
+            free(name);
+            if (match) {
+                ListView_SetItemState(g_hwndList, i,
+                                      LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_EnsureVisible(g_hwndList, i, FALSE);
+                app->initial_select[0] = L'\0';
+                if (app->focus_results_on_start)
+                    SetFocus(g_hwndList);
+                return;
+            }
+        }
+    }
+}
+
 static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     APP_STATE *app = g_app_ptr;
@@ -2273,6 +3727,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
 
     case WM_INITMENUPOPUP:
         ui_update_view_menu();
+        if (g_menu_file && (HMENU)wParam == g_menu_file)
+            ui_update_file_menu();
         /* fall through */
     case WM_DRAWITEM:
     case WM_MEASUREITEM:
@@ -2296,73 +3752,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         GetClientRect(hwnd, &rc);
         ui_init_visual_resources();
         
-        /* Create menu bar */
-        HMENU hMenu = CreateMenu();
-        HMENU hFile = CreatePopupMenu();
-        HMENU hEdit = CreatePopupMenu();
-        HMENU hView = CreatePopupMenu();
-        HMENU hSearch = CreatePopupMenu();
-        HMENU hIndex = CreatePopupMenu();
-        HMENU hHelp = CreatePopupMenu();
-        HMENU hTheme = CreatePopupMenu();
-        
-        AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT, L"Exit\tAlt+F4");
-        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_COPY, L"Copy\tCtrl+C");
-        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_COPY_PATH, L"Copy Full Path\tCtrl+Shift+C");
-        AppendMenuW(hEdit, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hEdit, MF_STRING, IDM_EDIT_SELECT_ALL, L"Select All\tCtrl+A");
-        
-        /* View panels and theme */
-        g_menu_view = hView;
-        g_menu_theme = hTheme;
-        AppendMenuW(hView, MF_STRING | (app->show_folders ? MF_CHECKED : 0),
-                    IDM_VIEW_FOLDERS, L"Folders");
-        AppendMenuW(hView, MF_STRING | (app->show_filters ? MF_CHECKED : 0),
-                    IDM_VIEW_FILTERS, L"Filters");
-        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_LIGHT, L"Light");
-        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_DARK, L"Dark");
-        AppendMenuW(hTheme, MF_STRING, IDM_VIEW_THEME_SYSTEM, L"System");
-        AppendMenuW(hView, MF_POPUP, (UINT_PTR)hTheme, L"Themes");
-        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
-
-        /* Existing search options */
-        UINT flags = app ? (app->match_case ? MF_CHECKED : 0) : 0;
-        AppendMenuW(hView, MF_STRING | flags, IDM_VIEW_MATCH_CASE, L"Match Case");
-        flags = app ? (app->match_whole_word ? MF_CHECKED : 0) : 0;
-        AppendMenuW(hView, MF_STRING | flags, IDM_VIEW_MATCH_WHOLE_WORD, L"Match Whole Word");
-        flags = app ? (app->match_path ? MF_CHECKED : 0) : 0;
-        AppendMenuW(hView, MF_STRING | flags, IDM_VIEW_MATCH_PATH, L"Match Path");
-        flags = app ? (app->use_regex ? MF_CHECKED : 0) : 0;
-        AppendMenuW(hView, MF_STRING | flags, IDM_VIEW_USE_REGEX, L"Use Regex");
-        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hView, MF_STRING, IDM_VIEW_REFRESH, L"Refresh\tF5");
-        AppendMenuW(hView, MF_SEPARATOR, 0, NULL);
-        HMENU hSort = CreatePopupMenu();
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_NAME, L"Name");
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_PATH, L"Path");
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_SIZE, L"Size");
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_DATE_MODIFIED, L"Date Modified");
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_DATE_CREATED, L"Date Created");
-        AppendMenuW(hSort, MF_STRING, IDM_VIEW_SORT_ATTRIBUTES, L"Attributes");
-        AppendMenuW(hView, MF_POPUP, (UINT_PTR)hSort, L"Sort By");
-        
-        AppendMenuW(hSearch, MF_STRING, 10070, L"Add to Bookmarks...");
-        AppendMenuW(hSearch, MF_STRING, 10071, L"Organize Filters...");
-        
-        AppendMenuW(hIndex, MF_STRING, IDM_INDEX_UPDATE, L"Update Index");
-        AppendMenuW(hIndex, MF_STRING, IDM_INDEX_REBUILD, L"Rebuild Index");
-        
-        AppendMenuW(hHelp, MF_STRING, IDM_HELP_ABOUT, L"About OpenEverything");
-        
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile, L"File");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEdit, L"Edit");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hView, L"View");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSearch, L"Search");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hIndex, L"Index");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelp, L"Help");
-        
-        SetMenu(hwnd, hMenu);
+        /* Build the full, localised menu bar. */
+        ui_build_menu(hwnd);
         
         g_hwndSearch = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -2397,13 +3788,13 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         LVCOLUMNW col = {0};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         
-        col.pszText = L"Name";          col.cx = ui_scale(app->column_width_name);     col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
-        col.pszText = L"Path";          col.cx = ui_scale(app->column_width_path);     col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
-        col.pszText = L"Size";          col.cx = ui_scale(app->column_width_size);     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
-        col.pszText = L"Date Modified"; col.cx = ui_scale(app->column_width_modified); col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
-        col.pszText = L"Date Created";  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
-        col.pszText = L"Attributes";    col.cx = ui_scale(app->column_width_attributes); col.iSubItem = COL_ATTRIBUTES; ListView_InsertColumn(g_hwndList, COL_ATTRIBUTES, &col);
-        col.pszText = L"Extension";     col.cx = ui_scale(app->column_width_extension);  col.iSubItem = COL_EXTENSION;  ListView_InsertColumn(g_hwndList, COL_EXTENSION, &col);
+        col.pszText = (wchar_t *)L("Name");          col.cx = ui_scale(app->column_width_name);     col.iSubItem = 0; ListView_InsertColumn(g_hwndList, 0, &col);
+        col.pszText = (wchar_t *)L("Path");          col.cx = ui_scale(app->column_width_path);     col.iSubItem = 1; ListView_InsertColumn(g_hwndList, 1, &col);
+        col.pszText = (wchar_t *)L("Size");          col.cx = ui_scale(app->column_width_size);     col.iSubItem = 2; ListView_InsertColumn(g_hwndList, 2, &col);
+        col.pszText = (wchar_t *)L("Date Modified"); col.cx = ui_scale(app->column_width_modified); col.iSubItem = 3; ListView_InsertColumn(g_hwndList, 3, &col);
+        col.pszText = (wchar_t *)L("Date Created");  col.cx = 0;   col.iSubItem = 4; ListView_InsertColumn(g_hwndList, 4, &col);
+        col.pszText = (wchar_t *)L("Attributes");    col.cx = ui_scale(app->column_width_attributes); col.iSubItem = COL_ATTRIBUTES; ListView_InsertColumn(g_hwndList, COL_ATTRIBUTES, &col);
+        col.pszText = (wchar_t *)L("Extension");     col.cx = ui_scale(app->column_width_extension);  col.iSubItem = COL_EXTENSION;  ListView_InsertColumn(g_hwndList, COL_EXTENSION, &col);
         ui_update_sort_indicator(g_hwndList, app->query.sort_column,
                                  app->query.sort_ascending);
         ui_disable_horizontal_scrollbar(g_hwndList);
@@ -2424,7 +3815,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         app->hwnd_status = g_hwndStatus;
 
         g_hwndFolderHeader = CreateWindowExW(
-            0, L"STATIC", L"Folders",
+            0, L"STATIC", L("Folders"),
             WS_CHILD | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
             0, 0, 0, 0, hwnd, NULL, cs->hInstance, NULL);
         g_hwndFolderTree = CreateWindowExW(
@@ -2433,11 +3824,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_DISABLEDRAGDROP,
             0, 0, 0, 0, hwnd, (HMENU)IDC_FOLDER_TREE, cs->hInstance, NULL);
         g_hwndSubfolders = CreateWindowExW(
-            0, L"BUTTON", L"Subfolders",
+            0, L"BUTTON", L("Subfolders"),
             WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
             0, 0, 0, 0, hwnd, (HMENU)IDC_SUBFOLDERS, cs->hInstance, NULL);
         g_hwndFilterHeader = CreateWindowExW(
-            0, L"STATIC", L"Filters",
+            0, L"STATIC", L("Filters"),
             WS_CHILD | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
             0, 0, 0, 0, hwnd, NULL, cs->hInstance, NULL);
         g_hwndFilterList = CreateWindowExW(
@@ -2458,16 +3849,30 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         SendMessageW(g_hwndSubfolders, BM_SETCHECK,
                      app->include_subfolders ? BST_CHECKED : BST_UNCHECKED, 0);
         for (int i = 0; i < FILTER_COUNT; i++)
-            SendMessageW(g_hwndFilterList, LB_ADDSTRING, 0, (LPARAM)g_filter_names[i]);
+            SendMessageW(g_hwndFilterList, LB_ADDSTRING, 0,
+                         (LPARAM)lang_tr(g_filter_names[i]));
         SendMessageW(g_hwndFilterList, LB_SETCURSEL, app->selected_filter, 0);
         ui_populate_folder_roots();
         ui_update_view_menu();
         ui_apply_theme(hwnd);
+        ui_apply_view_mode(hwnd);
         ui_apply_layout(hwnd);
         ui_start_metadata_worker(app, hwnd);
+        ui_tray_add(hwnd);
         
-        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"Loading index cache...");
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("Loading index cache..."));
         ui_start_cache_load(hwnd);
+
+        if (app->initial_search[0]) {
+            SetWindowTextW(g_hwndSearch, app->initial_search);
+            SetFocus(g_hwndSearch);
+        } else if (app->focus_results_on_start) {
+            SetFocus(g_hwndList);
+        }
+        if (app->show_cmdhelp_on_start)
+            PostMessageW(hwnd, WM_COMMAND, IDM_HELP_CMDLINE, 0);
+        if (app->show_language_on_start)
+            PostMessageW(hwnd, WM_COMMAND, IDM_VIEW_CHOOSE_LANGUAGE, 0);
         
         return 0;
     }
@@ -2486,6 +3891,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         return 0;
     
     case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED && app && app->minimize_to_tray &&
+            !app->force_exit) {
+            ui_hide_to_tray(hwnd);
+            return 0;
+        }
         ui_apply_layout(hwnd);
         return 0;
 
@@ -2598,9 +4008,83 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             ui_queue_search(hwnd);
             return 0;
         }
+        if (id >= IDM_VIEW_LANGUAGE_FIRST && id <= IDM_VIEW_LANGUAGE_LAST) {
+            int index = (int)id - IDM_VIEW_LANGUAGE_FIRST;
+            if (index < lang_count() && index != lang_current()) {
+                lang_set(index);
+                wcsncpy_s(app->language, 32, lang_current_id(), _TRUNCATE);
+                ui_refresh_language(hwnd);
+            }
+            return 0;
+        }
         
         switch (id) {
+        case IDM_FILE_NEW_WINDOW:
+            ui_open_new_search_window(hwnd);
+            break;
+
+        case IDM_FILE_OPEN:
+        {
+            int row = ui_selected_row();
+            if (row >= 0) {
+                wchar_t *path = NULL;
+                if (ui_copy_entry_snapshot(app, row, NULL, &path, NULL))
+                    ui_open_entry_path(hwnd, path);
+                free(path);
+            }
+            break;
+        }
+
+        case IDM_FILE_OPEN_PATH:
+        {
+            int row = ui_selected_row();
+            if (row >= 0) {
+                wchar_t *path = NULL;
+                if (ui_copy_entry_snapshot(app, row, NULL, &path, NULL))
+                    ui_open_entry_parent(hwnd, path);
+                free(path);
+            }
+            break;
+        }
+
+        case IDM_FILE_COPY_FULL_NAME:
+        {
+            int row = ui_selected_row();
+            if (row >= 0) {
+                wchar_t *path = NULL;
+                if (ui_copy_entry_snapshot(app, row, NULL, &path, NULL))
+                    ui_copy_text_to_clipboard(hwnd, path);
+                free(path);
+            }
+            break;
+        }
+
+        case IDM_FILE_DELETE:
+        {
+            int row = ui_selected_row();
+            if (row >= 0)
+                ui_delete_selected(hwnd, app, row);
+            break;
+        }
+
+        case IDM_FILE_RENAME:
+        {
+            int row = ui_selected_row();
+            if (row >= 0)
+                ui_rename_selected(hwnd, app, row);
+            break;
+        }
+
+        case IDM_FILE_PROPERTIES:
+        {
+            int row = ui_selected_row();
+            if (row >= 0)
+                ui_show_properties(hwnd, app, row);
+            break;
+        }
+
         case IDM_FILE_EXIT:
+            app->force_exit = 1;
             SendMessageW(hwnd, WM_CLOSE, 0, 0);
             break;
             
@@ -2644,6 +4128,82 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             app->show_filters = !app->show_filters;
             ui_update_view_menu();
             ui_apply_layout(hwnd);
+            break;
+
+        case IDM_VIEW_STATUS_BAR:
+            app->show_status_bar = !app->show_status_bar;
+            ui_update_view_menu();
+            ui_apply_layout(hwnd);
+            break;
+
+        case IDM_VIEW_DETAILS:
+            app->view_mode = VIEWMODE_DETAILS;
+            ui_update_view_menu();
+            ui_apply_view_mode(hwnd);
+            break;
+
+        case IDM_VIEW_THUMBNAILS_MEDIUM:
+            app->view_mode = VIEWMODE_MEDIUM_THUMBNAILS;
+            ui_update_view_menu();
+            ui_apply_view_mode(hwnd);
+            break;
+
+        case IDM_VIEW_THUMBNAILS_LARGE:
+            app->view_mode = VIEWMODE_LARGE_THUMBNAILS;
+            ui_update_view_menu();
+            ui_apply_view_mode(hwnd);
+            break;
+
+        case IDM_VIEW_THUMBNAILS_EXTRA_LARGE:
+            app->view_mode = VIEWMODE_EXTRA_LARGE_THUMBNAILS;
+            ui_update_view_menu();
+            ui_apply_view_mode(hwnd);
+            break;
+
+        case IDM_VIEW_CLOSE_TO_TRAY:
+            app->close_to_tray = !app->close_to_tray;
+            ui_update_view_menu();
+            break;
+
+        case IDM_VIEW_MINIMIZE_TO_TRAY:
+            app->minimize_to_tray = !app->minimize_to_tray;
+            ui_update_view_menu();
+            break;
+
+        case IDM_VIEW_CHOOSE_LANGUAGE:
+            ui_choose_language(hwnd);
+            break;
+
+        case IDM_VIEW_LANGUAGE_RELOAD:
+            lang_reload();
+            ui_refresh_language(hwnd);
+            break;
+
+        case IDM_TRAY_SHOW:
+            ui_show_window(hwnd);
+            break;
+
+        case IDM_TRAY_HIDE:
+            ui_hide_to_tray(hwnd);
+            break;
+
+        case IDM_TRAY_NEW_WINDOW:
+            ui_open_new_search_window(hwnd);
+            break;
+
+        case IDM_TRAY_CLOSE_TO_TRAY:
+            app->close_to_tray = !app->close_to_tray;
+            ui_update_view_menu();
+            break;
+
+        case IDM_TRAY_MINIMIZE_TO_TRAY:
+            app->minimize_to_tray = !app->minimize_to_tray;
+            ui_update_view_menu();
+            break;
+
+        case IDM_TRAY_EXIT:
+            app->force_exit = 1;
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
             break;
 
         case IDM_VIEW_THEME_LIGHT:
@@ -2693,12 +4253,22 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             ui_queue_search(hwnd);
             break;
             
-        case IDM_VIEW_SORT_NAME:          ui_change_sort(hwnd, app, COL_NAME, 1);          break;
-        case IDM_VIEW_SORT_PATH:          ui_change_sort(hwnd, app, COL_PATH, 1);          break;
-        case IDM_VIEW_SORT_SIZE:          ui_change_sort(hwnd, app, COL_SIZE, 1);          break;
-        case IDM_VIEW_SORT_DATE_MODIFIED: ui_change_sort(hwnd, app, COL_DATE_MODIFIED, 1); break;
-        case IDM_VIEW_SORT_DATE_CREATED:  ui_change_sort(hwnd, app, COL_DATE_CREATED, 1);  break;
-        case IDM_VIEW_SORT_ATTRIBUTES:    ui_change_sort(hwnd, app, COL_ATTRIBUTES, 1);    break;
+        case IDM_VIEW_SORT_NAME:          ui_change_sort(hwnd, app, COL_NAME, 2);          break;
+        case IDM_VIEW_SORT_PATH:          ui_change_sort(hwnd, app, COL_PATH, 2);          break;
+        case IDM_VIEW_SORT_SIZE:          ui_change_sort(hwnd, app, COL_SIZE, 2);          break;
+        case IDM_VIEW_SORT_DATE_MODIFIED: ui_change_sort(hwnd, app, COL_DATE_MODIFIED, 2); break;
+        case IDM_VIEW_SORT_DATE_CREATED:  ui_change_sort(hwnd, app, COL_DATE_CREATED, 2);  break;
+        case IDM_VIEW_SORT_ATTRIBUTES:    ui_change_sort(hwnd, app, COL_ATTRIBUTES, 2);    break;
+        case IDM_VIEW_SORT_EXTENSION:     ui_change_sort(hwnd, app, COL_EXTENSION, 2);     break;
+
+        case IDM_VIEW_SORT_ASCENDING:
+        case IDM_VIEW_SORT_DESCENDING:
+            app->query.sort_ascending = id == IDM_VIEW_SORT_ASCENDING;
+            ui_update_sort_indicator(g_hwndList, app->query.sort_column,
+                                     app->query.sort_ascending);
+            ui_update_view_menu();
+            ui_queue_search(hwnd);
+            break;
         
         case IDM_VIEW_REFRESH:
         case IDM_INDEX_UPDATE:
@@ -2710,18 +4280,27 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             PostMessageW(hwnd, WM_REFRESH, 0, 0);
             break;
             
-        case IDM_HELP_ABOUT:
-            MessageBoxW(hwnd,
-                L"OpenEverything v" OE_VERSION_WSTRING L"\n\n"
-                L"Everything的开源复刻版本。\n\n"
-                L"原理介绍：\n"
-                L"通过 NTFS USN Journal / MFT 快速建立文件名索引，\n"
-                L"使用本地缓存避免每次启动全量重建，\n"
-                L"搜索阶段使用后台线程和虚拟列表保持界面响应。\n\n"
-                L"GitHub主页：\n"
-                L"https://github.com/DisaWdcba",
-                L"About OpenEverything", MB_OK | MB_ICONINFORMATION);
+        case IDM_HELP_CMDLINE:
+            cmdhelp_show(hwnd, L("Command Line Options"), L("Close"));
             break;
+
+        case IDM_HELP_ABOUT:
+        {
+            wchar_t about[2048];
+            swprintf_s(about, 2048,
+                L("OpenEverything v%s\n\n"
+                  "An open-source Everything clone.\n\n"
+                  "How it works:\n"
+                  "A fast file-name index is built from the NTFS MFT/USN Journal,\n"
+                  "local caching avoids a full rebuild on every start,\n"
+                  "and searching runs on a background thread with a virtual list.\n\n"
+                  "Project:\n"
+                  "https://github.com/DisaWdcba"),
+                OE_VERSION_WSTRING);
+            MessageBoxW(hwnd, about, L("About OpenEverything"),
+                        MB_OK | MB_ICONINFORMATION);
+            break;
+        }
         }
         return 0;
     }
@@ -2743,6 +4322,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
     case WM_NOTIFY:
     {
         NMHDR *nm = (NMHDR *)lParam;
+        if (nm->hwndFrom == g_hwndList && nm->code == NM_CUSTOMDRAW)
+            return ui_custom_draw_list_item((NMLVCUSTOMDRAW *)lParam);
         if (nm->hwndFrom == ListView_GetHeader(g_hwndList) &&
             nm->code == NM_CUSTOMDRAW)
             return ui_custom_draw_list_header((NMCUSTOMDRAW *)lParam);
@@ -2784,6 +4365,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 NMLVDISPINFOW *di = (NMLVDISPINFOW *)lParam;
                 static wchar_t text_buf[512];
                 wchar_t icon_ext[64];
+                wchar_t *thumb_path = NULL;
                 INDEX_ENTRY *e;
                 int has_entry = 0;
                 int icon_is_dir = 0;
@@ -2805,6 +4387,9 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                     has_entry = 1;
                     icon_is_dir = e->is_directory;
                     index_copy_entry_extension_locked(app, e, icon_ext, 64);
+                    if (app->view_mode != VIEWMODE_DETAILS &&
+                        (di->item.mask & LVIF_IMAGE) && !g_in_scroll_thumb)
+                        thumb_path = index_duplicate_entry_path_locked(app, entry_index);
                     
                     if (di->item.mask & LVIF_TEXT) {
                         switch (di->item.iSubItem) {
@@ -2860,10 +4445,17 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                 LeaveCriticalSection(&app->index_lock);
                 
                 if (has_entry && (di->item.mask & LVIF_IMAGE)) {
-                    di->item.iImage = g_in_scroll_thumb
-                        ? (icon_is_dir ? g_icon_folder : g_icon_file)
-                        : ui_icon_for_type(icon_is_dir, icon_ext);
+                    if (thumb_path) {
+                        di->item.iImage = ui_thumb_image_for_path(thumb_path);
+                    } else if (app->view_mode != VIEWMODE_DETAILS) {
+                        di->item.iImage = 0;
+                    } else {
+                        di->item.iImage = g_in_scroll_thumb
+                            ? (icon_is_dir ? g_icon_folder : g_icon_file)
+                            : ui_icon_for_type(icon_is_dir, icon_ext);
+                    }
                 }
+                free(thumb_path);
                 break;
             }
             
@@ -2882,52 +4474,31 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             case LVN_KEYDOWN:
             {
                 NMLVKEYDOWN *kd = (NMLVKEYDOWN *)lParam;
-                if (kd->wVKey == VK_DELETE) {
-                    int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
-                    if (sel >= 0 && sel < app->filtered_count) {
-                        wchar_t *name = NULL;
+                int row = ui_selected_row();
+                int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                int alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+
+                if (row >= 0) {
+                    if (kd->wVKey == VK_DELETE) {
+                        ui_delete_selected(hwnd, app, row);
+                    } else if (kd->wVKey == VK_F2) {
+                        ui_rename_selected(hwnd, app, row);
+                    } else if (kd->wVKey == VK_RETURN) {
                         wchar_t *path = NULL;
-                        int is_directory = 0;
-                        wchar_t prompt[1024];
-                        if (!ui_copy_entry_snapshot(app, sel, &name, &path,
-                                                    &is_directory))
-                            break;
-                        _snwprintf_s(prompt, 1024, _TRUNCATE,
-                                     L"Delete \"%s\"?", name);
-                        if (MessageBoxW(hwnd, prompt, L"Delete",
-                                        MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            /* pFrom is a list, not a string: the shell scans
-                               past the first NUL for the list terminator, so a
-                               singly-terminated buffer reads beyond the
-                               allocation -- during a delete, no less. */
-                            size_t path_len = wcslen(path);
-                            wchar_t *op_from =
-                                (wchar_t *)calloc(path_len + 2, sizeof(wchar_t));
-                            if (op_from) {
-                                SHFILEOPSTRUCTW op = {0};
-                                memcpy(op_from, path, path_len * sizeof(wchar_t));
-                                op.hwnd = hwnd;
-                                op.wFunc = FO_DELETE;
-                                op.pFrom = op_from;
-                                /* Recycle files too. Delete used to unlink them
-                                   outright while sending folders to the bin,
-                                   so the same keystroke was unrecoverable for
-                                   files and undoable for directories. */
-                                op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
-                                SHFileOperationW(&op);
-                                free(op_from);
-                            }
+                        if (alt) {
+                            ui_show_properties(hwnd, app, row);
+                        } else if (ui_copy_entry_snapshot(app, row, NULL, &path, NULL)) {
+                            if (ctrl)
+                                ui_open_entry_parent(hwnd, path);
+                            else
+                                ui_open_entry_path(hwnd, path);
                         }
                         free(path);
-                        free(name);
-                    }
-                }
-                else if (kd->wVKey == VK_RETURN) {
-                    int sel = ListView_GetNextItem(g_hwndList, -1, LVNI_SELECTED);
-                    if (sel >= 0 && sel < app->filtered_count) {
+                    } else if (kd->wVKey == L'C' && ctrl && shift) {
                         wchar_t *path = NULL;
-                        if (ui_copy_entry_snapshot(app, sel, NULL, &path, NULL))
-                            ui_open_entry_path(hwnd, path);
+                        if (ui_copy_entry_snapshot(app, row, NULL, &path, NULL))
+                            ui_copy_text_to_clipboard(hwnd, path);
                         free(path);
                     }
                 }
@@ -2972,10 +4543,12 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                     }
                 }
                 
-                AppendMenuW(hPopup, MF_STRING, IDM_CTX_OPEN, L"Open");
-                AppendMenuW(hPopup, MF_STRING, IDM_CTX_OPEN_PATH, L"Open Path");
-                AppendMenuW(hPopup, MF_STRING, IDM_CTX_COPY_FULL_NAME, L"Copy Full Name to Clipboard");
-                AppendMenuW(hPopup, MF_STRING, IDM_CTX_SET_RUN_COUNT, L"Set Run Count");
+                /* The shell menu already provides Open, Rename, Delete and
+                   Properties (Rename requires CMF_CANRENAME, set below).
+                   Only add the actions the shell does not expose here. */
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_OPEN_PATH, L("Open Path"));
+                AppendMenuW(hPopup, MF_STRING, IDM_CTX_COPY_FULL_NAME,
+                            L("Copy Full Name to Clipboard"));
                 AppendMenuW(hPopup, MF_SEPARATOR, 0, NULL);
                 ui_append_shell_context_menu(hwnd, hPopup, entry_path, &shell_menu);
                 
@@ -2983,18 +4556,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
                                      pt.x, pt.y, 0, hwnd, NULL);
                 
                 switch (cmd) {
-                case IDM_CTX_OPEN:
-                    ui_open_entry_path(hwnd, entry_path);
-                    break;
                 case IDM_CTX_OPEN_PATH:
                     ui_open_entry_parent(hwnd, entry_path);
                     break;
                 case IDM_CTX_COPY_FULL_NAME:
                     ui_copy_text_to_clipboard(hwnd, entry_path);
-                    break;
-                case IDM_CTX_SET_RUN_COUNT:
-                    MessageBoxW(hwnd, L"Set Run Count is not implemented yet.",
-                                L"OpenEverything", MB_OK | MB_ICONINFORMATION);
                     break;
                 default:
                     if (cmd >= IDM_CTX_SHELL_FIRST && cmd <= IDM_CTX_SHELL_LAST)
@@ -3082,8 +4648,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             LeaveCriticalSection(&app->index_lock);
             
             if (accepted) {
+                ListView_SetItemState(g_hwndList, -1, 0,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
                 ui_update_listview(g_hwndList, app);
                 ui_update_status(g_hwndStatus, app);
+                ui_select_initial_result(app);
             }
         }
         
@@ -3133,18 +4702,18 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             wcscpy_s(label, 16, app->volumes[vol].drive_letter);
         if (pct >= INDEX_PROGRESS_FALLBACK_BASE &&
             pct <= INDEX_PROGRESS_FALLBACK_BASE + 100) {
-            swprintf_s(buf, 256, L"Indexing %s (compatibility scan) %d%%",
+            swprintf_s(buf, 256, L("Indexing %s (compatibility scan) %d%%"),
                        label, pct - INDEX_PROGRESS_FALLBACK_BASE);
         } else if (pct == INDEX_PROGRESS_SORTING) {
-            wcscpy_s(buf, 256, L"Sorting file names...");
+            wcsncpy_s(buf, 256, L("Sorting file names..."), _TRUNCATE);
         } else if (pct == INDEX_PROGRESS_BUILDING) {
-            wcscpy_s(buf, 256, L"Building search index...");
+            wcsncpy_s(buf, 256, L("Building search index..."), _TRUNCATE);
         } else if (pct == INDEX_PROGRESS_SAVING) {
-            wcscpy_s(buf, 256, L"Saving index...");
+            wcsncpy_s(buf, 256, L("Saving index..."), _TRUNCATE);
         } else if (pct > 0) {
-            swprintf_s(buf, 256, L"Indexing %s %d%%", label, pct);
+            swprintf_s(buf, 256, L("Indexing %s %d%%"), label, pct);
         } else {
-            swprintf_s(buf, 256, L"Indexing %s", label);
+            swprintf_s(buf, 256, L("Indexing %s"), label);
         }
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)buf);
         return 0;
@@ -3180,6 +4749,10 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         KillTimer(hwnd, IDT_STARTUP_SYNC);
         if ((int)wParam != CACHE_LOAD_LEGACY)
             SetTimer(hwnd, IDT_STARTUP_SYNC, STARTUP_SYNC_DELAY_MS, NULL);
+        if (app->start_reindex) {
+            app->start_reindex = 0;
+            PostMessageW(hwnd, WM_REFRESH, 0, 0);
+        }
         return 0;
     }
 
@@ -3196,11 +4769,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         HANDLE hThread;
         
         if (InterlockedCompareExchange(&g_reindexing, 1, 0) != 0) {
-            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"  Indexing already in progress");
+            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("  Indexing already in progress"));
             return 0;
         }
         
-        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"  Indexing...");
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("  Indexing..."));
         KillTimer(hwnd, IDT_STARTUP_SYNC);
         InterlockedExchange(&app->monitor_running, 0);
         InterlockedIncrement(&app->search_generation);
@@ -3212,7 +4785,7 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         ctx = (struct ReindexCtx *)calloc(1, sizeof(struct ReindexCtx));
         if (!ctx) {
             InterlockedExchange(&g_reindexing, 0);
-            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"  Failed to start indexing");
+            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("  Failed to start indexing"));
             return 0;
         }
         
@@ -3225,13 +4798,28 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         } else {
             free(ctx);
             InterlockedExchange(&g_reindexing, 0);
-            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L"  Failed to start indexing");
+            SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, (LPARAM)L("  Failed to start indexing"));
         }
         return 0;
     }
     
+    /* ---- Notification-area icon ---- */
+    case WM_TRAYICON:
+    {
+        UINT event = LOWORD(lParam);
+        if (event == WM_LBUTTONDBLCLK || event == WM_LBUTTONUP)
+            ui_show_window(hwnd);
+        else if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU)
+            ui_tray_menu(hwnd);
+        return 0;
+    }
+
     /* ---- Window close/destroy ---- */
     case WM_CLOSE:
+        if (!app->force_exit && app->close_to_tray) {
+            ui_hide_to_tray(hwnd);
+            return 0;
+        }
         if (g_hwndList) {
             /* Persist in logical units so a later DPI change keeps proportions. */
             app->column_width_name = ui_unscale(ListView_GetColumnWidth(g_hwndList, 0));
@@ -3260,7 +4848,8 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             app->sort_column = app->query.sort_column;
             app->sort_ascending = app->query.sort_ascending;
         }
-        config_save(app);
+        if (!app->secondary_window)
+            config_save(app);
         InterlockedExchange(&app->shutting_down, 1);
         InterlockedExchange(&g_metadata_running, 0);
         if (g_metadata_event)
@@ -3283,6 +4872,11 @@ static LRESULT CALLBACK everything_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
         return 0;
     
     case WM_DESTROY:
+        ui_tray_remove();
+        if (g_accel) {
+            DestroyAcceleratorTable(g_accel);
+            g_accel = NULL;
+        }
         ui_free_visual_resources();
         PostQuitMessage(0);
         return 0;
@@ -3335,7 +4929,7 @@ static LRESULT CALLBACK panel_header_proc(HWND hwnd, UINT msg, WPARAM wParam, LP
         text_rc = rc;
         text_rc.left += 10;
         text_rc.right -= close_width;
-        DrawTextW(dc, panel == 1 ? L"Folders" : L"Filters", -1, &text_rc,
+        DrawTextW(dc, panel == 1 ? L("Folders") : L("Filters"), -1, &text_rc,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         center_x = rc.right - close_width / 2;
@@ -3498,7 +5092,7 @@ static LRESULT CALLBACK subfolders_proc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         SetTextColor(dc, IsWindowEnabled(hwnd) ? g_color_text : RGB(145, 145, 145));
         old_font = SelectObject(dc,
                                 g_font_ui ? g_font_ui : GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(dc, L"Subfolders", -1, &text_rect,
+        DrawTextW(dc, L("Subfolders"), -1, &text_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, old_font);
         EndPaint(hwnd, &paint);
@@ -3553,6 +5147,16 @@ static LRESULT CALLBACK list_view_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     (void)ref_data;
 
     switch (msg) {
+    case WM_SYSKEYDOWN:
+        if (wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000) &&
+            g_app_ptr) {
+            int row = ui_selected_row();
+            if (row >= 0)
+                ui_show_properties(hwnd, g_app_ptr, row);
+            return 0;
+        }
+        break;
+
     case WM_STYLECHANGING:
         if ((int)wParam == GWL_STYLE && lParam) {
             STYLESTRUCT *styles = (STYLESTRUCT *)lParam;

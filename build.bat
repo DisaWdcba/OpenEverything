@@ -107,7 +107,7 @@ if errorlevel 1 (
 :: meant a failed build printed only "FAILED: <file>.c" with no reason.
 :: C4100 (unreferenced formal parameter) is unavoidable in Win32 callbacks.
 set CFLAGS=/nologo /W4 /wd4100 /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0600
-set LDFLAGS=/nologo user32.lib kernel32.lib comctl32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib ole32.lib oleaut32.lib shlwapi.lib uxtheme.lib dwmapi.lib
+set LDFLAGS=/nologo user32.lib kernel32.lib comctl32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib ole32.lib oleaut32.lib shlwapi.lib uxtheme.lib dwmapi.lib uuid.lib
 
 if /i "%CONFIG%"=="debug" (
     set CFLAGS=%CFLAGS% /Od /Zi /MTd /D_DEBUG /RTC1
@@ -119,7 +119,7 @@ if /i "%CONFIG%"=="debug" (
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 
-set MODULES=ntfs index search config cache ipc ui main
+set MODULES=ntfs index search config cache ipc lang cmdhelp ui main
 
 :: ---- Compile ----
 echo [1/8] Compiling GUI modules (%CONFIG%) ...
